@@ -1,0 +1,18 @@
+[project]
+name = "fitlink-backend"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Valeriacarmonaf",email = "97414518+Valeriacarmonaf@users.noreply.github.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+]
+
+[tool.poetry]
+packages = [{include = "fitlink_backend", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
