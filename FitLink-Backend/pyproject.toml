@@ -9,11 +9,11 @@ authors = [
 ]
 dependencies = [
   "fastapi>=0.110",
-  "uvicorn[standard]>=0.23",
+  "uvicorn[standard] (>=0.37.0,<0.38.0)",
   "python-dotenv>=1.0",
   "supabase>=2.6",
   "httpx>=0.27",
-  "psycopg[binary]>=3.2"
+  "psycopg[binary] (>=3.2.10,<4.0.0)"
 ]
 
 [tool.poetry]
