@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 import os
 import datetime
 from fastapi.middleware.cors import CORSMiddleware
+from fitlink_backend.routers import events
+from fitlink_backend.routers import stats
 
 load_dotenv()
 
@@ -21,6 +23,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(events.router)
+app.include_router(stats.router)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SERVICE_ROLE = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
