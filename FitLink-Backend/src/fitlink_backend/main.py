@@ -1,11 +1,19 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import os
 import datetime
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+
+# Rutas
 from fitlink_backend.routers import events
 from fitlink_backend.routers import stats
+
+# Modelos
+from fitlink_backend.models.UserSignUp import UserSignUp
+from fitlink_backend.models.UserResponse import UserResponse
+from fitlink_backend.models.UserLogin import UserLogin
 
 load_dotenv()
 
@@ -13,12 +21,7 @@ app = FastAPI(title="FitLink Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    ],  # tu frontend local
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,8 +30,11 @@ app.add_middleware(
 app.include_router(events.router)
 app.include_router(stats.router)
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SERVICE_ROLE = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+if not SUPABASE_URL or not SERVICE_ROLE:
+    raise RuntimeError("Faltan variables de entorno de Supabase")
+supabase: Client = create_client(SUPABASE_URL, SERVICE_ROLE)
 
 if not SUPABASE_URL or not SERVICE_ROLE:
     raise RuntimeError("Faltan variables SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el .env")
@@ -74,8 +80,6 @@ def events_upcoming(limit: int = 20):
         # Devuelve detalle del error para depurar rápido
         raise HTTPException(status_code=500, detail=str(e))
 
-from fastapi import Body
-
 @app.get("/users")
 def list_users():
     res = supabase.table("usuarios").select(
@@ -101,3 +105,85 @@ def delete_user(user_id: int):
     if res.error:
         raise HTTPException(status_code=500, detail=res.error.message)
     return {"ok": True}
+
+@app.post("/auth/register", status_code=201, response_model=None)
+def register_user(user_data: UserSignUp):
+    """
+    Registra un usuario en Supabase Auth (de forma segura con email/pass)
+    y luego crea su perfil público en la tabla 'usuarios' con el carnet.
+    """
+    try:
+        # 1. Crear el usuario en Supabase Auth. La contraseña se hashea aquí.
+        auth_response = supabase.auth.sign_up({
+            "email": user_data.email,
+            "password": user_data.password,
+        })
+
+        if auth_response.user is None:
+            error_message = getattr(auth_response.error, 'message', "No se pudo registrar al usuario.")
+            raise HTTPException(status_code=400, detail=error_message)
+
+        new_user = auth_response.user
+
+        # 2. Si Auth fue exitoso, crea el perfil en tu tabla 'usuarios'.
+        #    El 'id' del perfil DEBE ser el mismo que el 'id' de auth.users.
+        profile_data = {
+            "id": new_user.id,
+            "carnet": user_data.carnet,
+            "email": new_user.email,
+            "nombre": user_data.nombre,
+            "biografia": user_data.biografia,
+            "fecha_nacimiento": user_data.fechaNacimiento.isoformat(),
+            "municipio": user_data.ciudad,
+            "foto_url": user_data.foto
+        }
+
+        profile_res = supabase.table("usuarios").insert(profile_data).execute()
+
+        if profile_res.error:
+            # En un caso real, deberías borrar el usuario de auth si el perfil falla (rollback).
+            # Por ahora, solo lanzamos el error.
+            raise HTTPException(status_code=500, detail=f"Usuario de Auth creado, pero falló la creación del perfil: {profile_res.error.message}")
+
+        return {"message": "Usuario registrado. Revisa tu email para confirmar la cuenta.", "user": new_user.model_dump()}
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/auth/login", response_model=None)
+async def login_user(user_data: UserLogin):
+    """
+    Inicia sesión de un usuario únicamente con su email y contraseña.
+    """
+    try:
+        response = supabase.auth.sign_in_with_password({
+            "email": str(user_data.email),
+            "password": str(user_data.password),
+        })
+
+        return {
+            "message": "Login exitoso",
+            "session": response.session.model_dump(),
+            "user": response.user.model_dump()
+        }
+    except Exception as e:
+        print(f"Error inesperado en login: {e}")
+        raise HTTPException(status_code=500, detail="Ocurrió un error inesperado en el servidor.")
+    
+@app.get("/auth/google", response_model=None)
+async def login_with_google(redirect_to: Optional[str] = None):
+    """
+    Genera y devuelve la URL de Supabase para iniciar sesión con Google.
+    """
+    final_redirect_to = redirect_to if redirect_to else os.environ["VITE_API_URL"]
+    
+    supabase_google_oauth_url = (
+        f"{os.environ['SUPABASE_URL']}/auth/v1/authorize?"
+        f"provider=google&"
+        f"redirect_to={final_redirect_to}"
+    )
+    
+    return {"oauth_url": supabase_google_oauth_url}
