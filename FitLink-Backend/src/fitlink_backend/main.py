@@ -129,11 +129,11 @@ def register_user(user_data: UserSignUp):
         #    El 'id' del perfil DEBE ser el mismo que el 'id' de auth.users.
         profile_data = {
             "id": new_user.id,
-            "carnet": user_data.carnet, # Guardamos el carnet aquí
+            "carnet": user_data.carnet,
             "email": new_user.email,
             "nombre": user_data.nombre,
             "biografia": user_data.biografia,
-            "fecha_nacimiento": user_data.fechaNacimiento,
+            "fecha_nacimiento": user_data.fechaNacimiento.isoformat(),
             "municipio": user_data.ciudad,
             "foto_url": user_data.foto
         }
@@ -153,42 +153,26 @@ def register_user(user_data: UserSignUp):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-app.post("/auth/login", response_model=None)
+@app.post("/auth/login", response_model=None)
 async def login_user(user_data: UserLogin):
     """
-    Inicia sesión de un usuario con su email O su carnet.
+    Inicia sesión de un usuario únicamente con su email y contraseña.
     """
     try:
-        login_email = user_data.identifier
-
-        # Si el identificador NO es un email, asumimos que es un carnet
-        if "@" not in user_data.identifier:
-            # Buscamos el email correspondiente a ese carnet en la tabla de perfiles
-            profile_response = supabase.table("usuarios").select("email").eq("carnet", user_data.identifier).limit(1).execute()
-            if not profile_response.data:
-                raise HTTPException(status_code=401, detail="Credenciales inválidas")
-            login_email = profile_response.data[0]['email']
-
-        # Procedemos a iniciar sesión con el email
         response = supabase.auth.sign_in_with_password({
-            "email": login_email,
-            "password": user_data.password,
+            "email": str(user_data.email),
+            "password": str(user_data.password),
         })
-        if response.user is None:
-            error_message = getattr(response.error, 'message', "Credenciales inválidas")
-            raise HTTPException(status_code=401, detail=error_message)
 
         return {
             "message": "Login exitoso",
             "session": response.session.model_dump(),
             "user": response.user.model_dump()
         }
-    except HTTPException as e:
-        raise e
     except Exception as e:
         print(f"Error inesperado en login: {e}")
         raise HTTPException(status_code=500, detail="Ocurrió un error inesperado en el servidor.")
-
+    
 @app.get("/auth/google", response_model=None)
 async def login_with_google(redirect_to: Optional[str] = None):
     """
