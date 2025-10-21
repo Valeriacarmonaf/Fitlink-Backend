@@ -11,7 +11,7 @@ from fitlink_backend.routers import events
 from fitlink_backend.routers import stats
 
 # Modelos
-from fitlink_backend.models.UserCreate import UserCreate
+from fitlink_backend.models.UserSignUp import UserSignUp
 from fitlink_backend.models.UserResponse import UserResponse
 from fitlink_backend.models.UserLogin import UserLogin
 
@@ -21,12 +21,7 @@ app = FastAPI(title="FitLink Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    ],  # tu frontend local
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,8 +30,11 @@ app.add_middleware(
 app.include_router(events.router)
 app.include_router(stats.router)
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SERVICE_ROLE = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+if not SUPABASE_URL or not SERVICE_ROLE:
+    raise RuntimeError("Faltan variables de entorno de Supabase")
+supabase: Client = create_client(SUPABASE_URL, SERVICE_ROLE)
 
 if not SUPABASE_URL or not SERVICE_ROLE:
     raise RuntimeError("Faltan variables SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el .env")
@@ -82,47 +80,6 @@ def events_upcoming(limit: int = 20):
         # Devuelve detalle del error para depurar rápido
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/users", status_code=201, response_model=None)
-def create_user(user_data: UserCreate):
-    """
-    Crea un nuevo usuario en la base de datos (tabla 'usuarios').
-    """
-    try:
-        # 1. Comprobar si el ID (o email, si cambias el campo) ya existe
-        existing = supabase.table("usuarios").select("id").eq("id", user_data.id).execute()
-
-        if existing.data:
-            # 409 Conflict: El recurso ya existe.
-            # Esto es lo que React recibirá si el ID está duplicado.
-            raise HTTPException(
-                status_code=409, 
-                detail="Este ID ya está en uso. Por favor, intente con otro."
-            )
-
-        # 2. Mapear los nombres de React (camelCase) a los nombres de tu DB (snake_case)
-        user_to_insert = {
-            "id": user_data.id,
-            "nombre": user_data.nombre,
-            "biografia": user_data.biografia,
-            "fecha_nacimiento": user_data.fechaNacimiento,
-            "municipio": user_data.ciudad,
-            "foto_url": user_data.foto
-        }
-        
-        # 3. Insertar el nuevo usuario en Supabase
-        res = supabase.table("usuarios").insert(user_to_insert).execute()
-
-        if res.error:
-            raise HTTPException(status_code=500, detail=str(res.error.message))
-
-        # 4. Éxito: Devolver los datos del usuario creado
-        return res.data[0]
-
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error inesperado del servidor: {str(e)}")
-
 @app.get("/users")
 def list_users():
     res = supabase.table("usuarios").select(
@@ -149,92 +106,100 @@ def delete_user(user_id: int):
         raise HTTPException(status_code=500, detail=res.error.message)
     return {"ok": True}
 
-@app.post("/auth/login")
-async def login_user(user_data: UserLogin):
+@app.post("/auth/register", status_code=201, response_model=None)
+def register_user(user_data: UserSignUp):
     """
-    Inicia sesión de un usuario con email y contraseña.
+    Registra un usuario en Supabase Auth (de forma segura con email/pass)
+    y luego crea su perfil público en la tabla 'usuarios' con el carnet.
     """
     try:
-        # Aquí usaremos el método 'sign_in_with_password' de Supabase
-        # IMPORTANTE: Los datos de usuario se gestionan en la tabla 'auth.users' de Supabase,
-        # no en tu tabla 'usuarios'. Tu tabla 'usuarios' es para perfil extendido.
-        response = supabase.auth.sign_in_with_password({
+        # 1. Crear el usuario en Supabase Auth. La contraseña se hashea aquí.
+        auth_response = supabase.auth.sign_up({
             "email": user_data.email,
             "password": user_data.password,
         })
 
-        # Si hay un error de autenticación (ej. credenciales inválidas)
-        if response.user is None:
-            # Supabase auth devuelve un objeto con user=None y error si falla.
-            # El error es un diccionario, así que lo convertimos a string.
-            error_message = response.error.message if response.error else "Credenciales inválidas"
-            raise HTTPException(status_code=401, detail=error_message)
-        
-        # Si la autenticación es exitosa, response.session y response.user contendrán los datos
-        return {
-            "message": "Login exitoso",
-            "access_token": response.session.access_token,
-            "refresh_token": response.session.refresh_token,
-            "user": response.user.model_dump() # .model_dump() para Pydantic v2
+        if auth_response.user is None:
+            error_message = getattr(auth_response.error, 'message', "No se pudo registrar al usuario.")
+            raise HTTPException(status_code=400, detail=error_message)
+
+        new_user = auth_response.user
+
+        # 2. Si Auth fue exitoso, crea el perfil en tu tabla 'usuarios'.
+        #    El 'id' del perfil DEBE ser el mismo que el 'id' de auth.users.
+        profile_data = {
+            "id": new_user.id,
+            "carnet": user_data.carnet, # Guardamos el carnet aquí
+            "email": new_user.email,
+            "nombre": user_data.nombre,
+            "biografia": user_data.biografia,
+            "fecha_nacimiento": user_data.fechaNacimiento,
+            "municipio": user_data.ciudad,
+            "foto_url": user_data.foto
         }
+
+        profile_res = supabase.table("usuarios").insert(profile_data).execute()
+
+        if profile_res.error:
+            # En un caso real, deberías borrar el usuario de auth si el perfil falla (rollback).
+            # Por ahora, solo lanzamos el error.
+            raise HTTPException(status_code=500, detail=f"Usuario de Auth creado, pero falló la creación del perfil: {profile_res.error.message}")
+
+        return {"message": "Usuario registrado. Revisa tu email para confirmar la cuenta.", "user": new_user.model_dump()}
 
     except HTTPException as e:
         raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/auth/google")
+app.post("/auth/login", response_model=None)
+async def login_user(user_data: UserLogin):
+    """
+    Inicia sesión de un usuario con su email O su carnet.
+    """
+    try:
+        login_email = user_data.identifier
+
+        # Si el identificador NO es un email, asumimos que es un carnet
+        if "@" not in user_data.identifier:
+            # Buscamos el email correspondiente a ese carnet en la tabla de perfiles
+            profile_response = supabase.table("usuarios").select("email").eq("carnet", user_data.identifier).limit(1).execute()
+            if not profile_response.data:
+                raise HTTPException(status_code=401, detail="Credenciales inválidas")
+            login_email = profile_response.data[0]['email']
+
+        # Procedemos a iniciar sesión con el email
+        response = supabase.auth.sign_in_with_password({
+            "email": login_email,
+            "password": user_data.password,
+        })
+        if response.user is None:
+            error_message = getattr(response.error, 'message', "Credenciales inválidas")
+            raise HTTPException(status_code=401, detail=error_message)
+
+        return {
+            "message": "Login exitoso",
+            "session": response.session.model_dump(),
+            "user": response.user.model_dump()
+        }
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error inesperado en login: {e}")
+        raise HTTPException(status_code=500, detail="Ocurrió un error inesperado en el servidor.")
+
+@app.get("/auth/google", response_model=None)
 async def login_with_google(redirect_to: Optional[str] = None):
     """
-    Redirige al cliente a la URL de inicio de sesión de Google a través de Supabase.
-    `redirect_to` es la URL en tu frontend a la que Supabase debería redirigir después del login.
+    Genera y devuelve la URL de Supabase para iniciar sesión con Google.
     """
-    # La URL a la que Supabase redirigirá después de la autenticación.
-    # Necesitas que esta URL esté en la lista de URLs de redirección de tu proyecto Supabase.
-    # Por ejemplo, "http://localhost:5173/dashboard" o "http://localhost:5173/callback"
+    final_redirect_to = redirect_to if redirect_to else os.environ["VITE_API_URL"]
     
-    # Si no se especifica, usa la URL base de tu frontend.
-    # Es crucial que esta URL esté registrada en tus "Redirect URLs" en Supabase Auth Settings.
-    final_redirect_to = redirect_to if redirect_to else "http://localhost:5173/"
-
-    # Genera la URL de OAuth de Supabase para Google
-    # El método 'get_authorize_url' es más seguro que construirla manualmente.
-    # Necesitarás 'gotrue-py' para esto, pero dado que usas el cliente Supabase,
-    # ya deberías tener acceso al cliente auth.
+    supabase_google_oauth_url = (
+        f"{os.environ['SUPABASE_URL']}/auth/v1/authorize?"
+        f"provider=google&"
+        f"redirect_to={final_redirect_to}"
+    )
     
-    # El cliente de Supabase tiene un atributo 'auth' que puede generar estas URLs
-    # Usaremos un método que construya la URL de autenticación
-    
-    # NOTA: Supabase SDK V2 ha cambiado la forma de manejar esto.
-    # Ya no hay un 'get_authorize_url' directo para proveedores.
-    # En su lugar, el frontend suele redirigir directamente a la URL de Supabase para el proveedor.
-    # O, si quieres pasar por FastAPI, tendrías que simular la redirección.
-    
-    # La forma más directa es que el frontend genere la URL de redirección:
-    # `https://{YOUR_PROJECT_REF}.supabase.co/auth/v1/authorize?provider=google&redirect_to=${frontend_url}`
-    # Sin embargo, si quieres que FastAPI haga la redirección:
-
-    try:
-        # La forma más estándar de hacer esto es que el cliente reciba la URL de Supabase
-        # y luego el cliente redirija directamente a esa URL.
-        # FastAPI, en este caso, solo serviría para *generar* la URL y devolverla.
-        
-        # Construye la URL de redirección de Supabase para Google
-        # Asegúrate de que '{project_ref}' sea tu ID de proyecto de Supabase
-        # y que el 'redirect_to' sea una URL permitida en Supabase Auth -> URL Configuration
-        supabase_google_oauth_url = (
-            f"{os.environ['SUPABASE_URL']}/auth/v1/authorize?"
-            f"provider=google&"
-            f"redirect_to={final_redirect_to}"
-        )
-        
-        # Puedes simplemente devolver esta URL al frontend
-        return {"oauth_url": supabase_google_oauth_url}
-        
-        # O, si quieres que FastAPI haga la redirección DIRECTA (menos común para OAuth)
-        # from fastapi.responses import RedirectResponse
-        # return RedirectResponse(url=supabase_google_oauth_url, status_code=302)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al generar URL de Google OAuth: {str(e)}")
+    return {"oauth_url": supabase_google_oauth_url}
