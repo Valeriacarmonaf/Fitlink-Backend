@@ -109,48 +109,62 @@ def delete_user(user_id: int):
 @app.post("/auth/register", status_code=201, response_model=None)
 def register_user(user_data: UserSignUp):
     """
-    Registra un usuario en Supabase Auth (de forma segura con email/pass)
-    y luego crea su perfil público en la tabla 'usuarios' con el carnet.
+    Registra un usuario en Supabase Auth y crea su perfil en la tabla 'usuarios'.
+    Maneja errores con un try/except genérico.
     """
+    new_user = None
     try:
-        # 1. Crear el usuario en Supabase Auth. La contraseña se hashea aquí.
+        # 1. Crear el usuario en Supabase Auth.
         auth_response = supabase.auth.sign_up({
             "email": user_data.email,
             "password": user_data.password,
         })
-
-        if auth_response.user is None:
-            error_message = getattr(auth_response.error, 'message', "No se pudo registrar al usuario.")
-            raise HTTPException(status_code=400, detail=error_message)
-
         new_user = auth_response.user
 
-        # 2. Si Auth fue exitoso, crea el perfil en tu tabla 'usuarios'.
-        #    El 'id' del perfil DEBE ser el mismo que el 'id' de auth.users.
+        # 2. Crear el perfil en la tabla 'usuarios'.
         profile_data = {
             "id": new_user.id,
             "carnet": user_data.carnet,
-            "email": new_user.email,
+            "email": user_data.email,
             "nombre": user_data.nombre,
             "biografia": user_data.biografia,
             "fecha_nacimiento": user_data.fechaNacimiento.isoformat(),
             "municipio": user_data.ciudad,
             "foto_url": user_data.foto
         }
+        supabase.table("usuarios").insert(profile_data).execute()
 
-        profile_res = supabase.table("usuarios").insert(profile_data).execute()
+        return {"message": "Usuario registrado. Revisa tu email para confirmar.", "user": new_user.model_dump()}
 
-        if profile_res.error:
-            # En un caso real, deberías borrar el usuario de auth si el perfil falla (rollback).
-            # Por ahora, solo lanzamos el error.
-            raise HTTPException(status_code=500, detail=f"Usuario de Auth creado, pero falló la creación del perfil: {profile_res.error.message}")
-
-        return {"message": "Usuario registrado. Revisa tu email para confirmar la cuenta.", "user": new_user.model_dump()}
-
-    except HTTPException as e:
-        raise e
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        error_message = str(e)
+        
+        # --- ¡MANEJO DE ERRORES MEJORADO! ---
+        
+        # Primero, revisamos si el error es el que estás viendo.
+        if "User already registered" in error_message:
+            # Si el email ya existe, es un error de validación simple.
+            # No se necesita rollback porque 'new_user' será None.
+            raise HTTPException(status_code=400, detail="Este correo electrónico ya está en uso.")
+        
+        # Si el error es por el carnet duplicado (ejemplo)
+        if "usuarios_carnet_key" in error_message:
+            error_detail = "Este carnet ya está registrado."
+        else:
+            # Otro error (ej. RLS, etc.)
+            error_detail = error_message
+
+        # --- Lógica de Rollback ---
+        # Si el usuario de auth se creó PERO el perfil falló por otra razón
+        if new_user and new_user.id:
+            try:
+                supabase.auth.admin.delete_user(new_user.id)
+            except Exception as delete_e:
+                # Si el borrado también falla, informamos ambos errores
+                raise HTTPException(status_code=500, detail=f"Falló la creación del perfil ({error_detail}) y también falló la limpieza del usuario de auth ({delete_e}).")
+        
+        # Devolver el error específico (ej. "Este carnet ya está registrado.")
+        raise HTTPException(status_code=400, detail=error_detail)
 
 
 @app.post("/auth/login", response_model=None)
