@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 import datetime
 from fastapi.middleware.cors import CORSMiddleware
+from fitlink_backend.routers.chat import router as chat_router
 from typing import Optional
 
 # Rutas
@@ -29,6 +30,7 @@ app.add_middleware(
 
 app.include_router(events.router)
 app.include_router(stats.router)
+app.include_router(chat_router)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
