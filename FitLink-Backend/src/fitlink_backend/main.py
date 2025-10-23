@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fitlink_backend.routers.chat import router as chat_router
 from typing import Optional
 
+
 # Rutas
 from fitlink_backend.routers import events
 from fitlink_backend.routers import stats
