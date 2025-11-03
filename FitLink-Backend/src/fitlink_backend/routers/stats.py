@@ -1,4 +1,3 @@
-# src/fitlink_backend/routers/stats.py
 from fastapi import APIRouter
 from datetime import datetime, timezone
 from typing import Dict
@@ -15,9 +14,11 @@ def stats() -> Dict[str, int]:
     r_users = supabase.table("usuarios").select("id", count="exact").execute()
     usuarios = r_users.count or 0
 
-    # Categorías (distintas en eventos)
-    r_cats = supabase.table("eventos").select("categoria").execute()
-    categorias = len({(row.get("categoria") or "").strip().lower() for row in (r_cats.data or []) if row.get("categoria")})
+    # --- SECCIÓN CORREGIDA ---
+    # Contar el total de categorías definidas en la tabla 'categoria'
+    r_cats = supabase.table("categoria").select("id", count="exact").execute()
+    categorias = r_cats.count or 0
+    # --- FIN DE LA CORRECCIÓN ---
 
     # Próximos eventos (inicio >= ahora)
     r_up = (

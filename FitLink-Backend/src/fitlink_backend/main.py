@@ -5,44 +5,66 @@ import os
 import datetime
 from fastapi.middleware.cors import CORSMiddleware
 from fitlink_backend.routers.chat import router as chat_router
-from typing import Optional
-
+from fastapi import Depends, Header
+from typing import Annotated
+from typing import Optional, Any
 
 # Rutas
 from fitlink_backend.routers import events
 from fitlink_backend.routers import stats
+from fitlink_backend.routers import suggestions
 
 # Modelos
 from fitlink_backend.models.UserSignUp import UserSignUp
 from fitlink_backend.models.UserResponse import UserResponse
 from fitlink_backend.models.UserLogin import UserLogin
 
+from fitlink_backend.supabase_client import supabase
+
 load_dotenv()
 
 app = FastAPI(title="FitLink Backend")
 
+origins = [
+    "http://localhost:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://PC_IP:5173",],
+    allow_origins=origins,  # <-- Usa la lista de orígenes
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],      # Permite todos los métodos (GET, POST, etc.)
+    allow_headers=["*"],      # Permite todas las cabeceras
 )
 
 app.include_router(events.router)
 app.include_router(stats.router)
 app.include_router(chat_router)
+app.include_router(suggestions.router)
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-if not SUPABASE_URL or not SERVICE_ROLE:
-    raise RuntimeError("Faltan variables de entorno de Supabase")
-supabase: Client = create_client(SUPABASE_URL, SERVICE_ROLE)
+async def get_current_user(authorization: Annotated[str | None, Header()] = None) -> Any:
+    """
+    Dependencia de FastAPI para obtener el usuario autenticado...
+    """
+    # El resto de la función no cambia
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Falta el encabezado de autorización")
+    
+    token = authorization.replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Token malformado")
 
-if not SUPABASE_URL or not SERVICE_ROLE:
-    raise RuntimeError("Faltan variables SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el .env")
-
-supabase: Client = create_client(SUPABASE_URL, SERVICE_ROLE)
+    try:
+        user_response = supabase.auth.get_user(token)
+        
+        if user_response.user is None:
+            raise HTTPException(status_code=401, detail="Token inválido o sesión expirada")
+        
+        # Sigue devolviendo el objeto 'user' completo
+        return user_response.user 
+    
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Error de autenticación: {str(e)}")
 
 @app.get("/health")
 def health():
@@ -108,6 +130,77 @@ def delete_user(user_id: int):
     if res.error:
         raise HTTPException(status_code=500, detail=res.error.message)
     return {"ok": True}
+
+@app.get("/events/suggestions")
+async def get_event_suggestions(
+    current_user: Annotated[Any, Depends(get_current_user)]
+):
+    """
+    Obtiene sugerencias de eventos para el usuario autenticado.
+    LÓGICA ACTUALIZADA:
+    1. Buscar eventos en el MISMO MUNICIPIO del usuario.
+    2. Buscar eventos cuyo CATEGORIA_ID coincida con las IDs
+       de las categorías guardadas por el usuario.
+    3. Solo mostrar eventos futuros y no cancelados.
+    """
+    try:
+        user_id = current_user.id
+        user_email = current_user.email
+
+        # 1. Obtener el municipio del perfil del usuario
+        profile_res = supabase.table("usuarios") \
+            .select("municipio") \
+            .eq("id", user_id) \
+            .single() \
+            .execute()
+
+        if not profile_res.data:
+            raise HTTPException(status_code=404, detail="Perfil de usuario no encontrado.")
+
+        user_municipio = profile_res.data.get('municipio')
+        if not user_municipio:
+            raise HTTPException(status_code=400, detail="Tu perfil no tiene un municipio configurado.")
+
+        # 2. Obtener las IDs de las categorías (intereses) del usuario
+        my_skills_res = supabase.table("usuario_categoria") \
+            .select("categoria_id") \
+            .eq("usuario_email", user_email) \
+            .execute()
+
+        if not my_skills_res.data:
+            return [] # Si no tiene intereses (categorías), no podemos sugerir
+
+        my_category_ids = [skill['categoria_id'] for skill in my_skills_res.data]
+        
+        # 3. YA NO NECESITAMOS BUSCAR LOS NOMBRES DE LAS CATEGORÍAS.
+        #    Podemos filtrar directamente por las IDs (my_category_ids).
+        
+        # 4. Buscar eventos que coincidan
+        now = datetime.datetime.utcnow().isoformat()
+        
+        events_res = supabase.table("eventos") \
+            .select(
+                """
+                *,
+                categoria ( nombre, icono )
+                """
+            ) \
+            .eq("municipio", user_municipio) \
+            .in_("categoria_id", my_category_ids) \
+            .gte("inicio", now) \
+            .neq("estado", "cancelado") \
+            .order("inicio", desc=False) \
+            .limit(20) \
+            .execute()
+
+        # Devuelve los datos o un array vacío (corrigiendo el error 'null')
+        return events_res.data or []
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error inesperado en /events/suggestions: {e}")
+        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
 
 @app.post("/auth/register", status_code=201, response_model=None)
 def register_user(user_data: UserSignUp):
