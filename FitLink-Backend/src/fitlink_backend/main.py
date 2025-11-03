@@ -13,6 +13,7 @@ from typing import Optional, Any
 from fitlink_backend.routers import events
 from fitlink_backend.routers import stats
 from fitlink_backend.routers import suggestions
+from fitlink_backend.routers import users
 
 # Modelos
 from fitlink_backend.models.UserSignUp import UserSignUp
@@ -39,14 +40,16 @@ app.add_middleware(
 
 app.include_router(events.router)
 app.include_router(stats.router)
-app.include_router(chat_router)
+#app.include_router(chat.router)
 app.include_router(suggestions.router)
+app.include_router(users.router) # <-- 2. INCLUIDO EL NUEVO ROUTER DE USUARIOS
 
 async def get_current_user(authorization: Annotated[str | None, Header()] = None) -> Any:
     """
     Dependencia de FastAPI para obtener el usuario autenticado...
     """
-    # El resto de la función no cambia
+    # (Esta función la movimos a dependencies.py, pero 
+    # la mantenemos aquí si prefieres no crear ese archivo)
     if not authorization:
         raise HTTPException(status_code=401, detail="Falta el encabezado de autorización")
     
@@ -70,39 +73,24 @@ async def get_current_user(authorization: Annotated[str | None, Header()] = None
 def health():
     return {"ok": True}
 
-@app.get("/stats")
-def stats():
-    # KPIs rápidos (usa head+count para eficiencia)
-    users = supabase.table("usuarios").select("id", count="exact", head=True).execute()
-    cats  = supabase.table("categoria").select("id", count="exact", head=True).execute()
-    evts  = supabase.table("eventos") \
-        .select("id", count=None) \
-        .neq("estado","cancelado").gte("inicio", __import__("datetime").datetime.utcnow().isoformat()) \
-        .execute()
-    return {
-        "usuarios": users.count or 0,
-        "categorias": cats.count or 0,
-        "eventosProximos": len(evts.data or []),
-    }
+# --- 3. ENDPOINT /stats ELIMINADO ---
+# (Ya está en 'stats.router')
 
 @app.get("/events/upcoming")
 def events_upcoming(limit: int = 20):
     import datetime
     try:
-        # ⚠️ Usamos select("*") para evitar fallos por nombres (Municipio vs municipio, nombre_evento, etc.)
         res = (
             supabase.table("eventos")
-            .select("*")
+            .select("*, categoria ( nombre, icono )") # <-- Actualizado para usar la FK
             .neq("estado", "cancelado")
             .gte("inicio", datetime.datetime.utcnow().isoformat())
             .order("inicio", desc=False)
             .limit(limit)
             .execute()
         )
-        # SDK v2: res no tiene .error; si hay error lanza APIError antes.
         return res.data or []
     except Exception as e:
-        # Devuelve detalle del error para depurar rápido
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/users")
@@ -117,7 +105,6 @@ def list_users():
 
 @app.put("/users/{user_id}")
 def update_user(user_id: int, payload: dict = Body(...)):
-    # payload: {nombre, biografia, fecha_nacimiento, municipio, foto_url}
     res = supabase.table("usuarios").update(payload).eq("id", user_id).execute()
     if res.error:
         raise HTTPException(status_code=500, detail=res.error.message)
@@ -131,85 +118,16 @@ def delete_user(user_id: int):
         raise HTTPException(status_code=500, detail=res.error.message)
     return {"ok": True}
 
-@app.get("/events/suggestions")
-async def get_event_suggestions(
-    current_user: Annotated[Any, Depends(get_current_user)]
-):
-    """
-    Obtiene sugerencias de eventos para el usuario autenticado.
-    LÓGICA ACTUALIZADA:
-    1. Buscar eventos en el MISMO MUNICIPIO del usuario.
-    2. Buscar eventos cuyo CATEGORIA_ID coincida con las IDs
-       de las categorías guardadas por el usuario.
-    3. Solo mostrar eventos futuros y no cancelados.
-    """
-    try:
-        user_id = current_user.id
-        user_email = current_user.email
+# --- 4. ENDPOINT /events/suggestions ELIMINADO ---
+# (Ya está en 'suggestions.router' con la lógica de prioridad)
 
-        # 1. Obtener el municipio del perfil del usuario
-        profile_res = supabase.table("usuarios") \
-            .select("municipio") \
-            .eq("id", user_id) \
-            .single() \
-            .execute()
-
-        if not profile_res.data:
-            raise HTTPException(status_code=404, detail="Perfil de usuario no encontrado.")
-
-        user_municipio = profile_res.data.get('municipio')
-        if not user_municipio:
-            raise HTTPException(status_code=400, detail="Tu perfil no tiene un municipio configurado.")
-
-        # 2. Obtener las IDs de las categorías (intereses) del usuario
-        my_skills_res = supabase.table("usuario_categoria") \
-            .select("categoria_id") \
-            .eq("usuario_email", user_email) \
-            .execute()
-
-        if not my_skills_res.data:
-            return [] # Si no tiene intereses (categorías), no podemos sugerir
-
-        my_category_ids = [skill['categoria_id'] for skill in my_skills_res.data]
-        
-        # 3. YA NO NECESITAMOS BUSCAR LOS NOMBRES DE LAS CATEGORÍAS.
-        #    Podemos filtrar directamente por las IDs (my_category_ids).
-        
-        # 4. Buscar eventos que coincidan
-        now = datetime.datetime.utcnow().isoformat()
-        
-        events_res = supabase.table("eventos") \
-            .select(
-                """
-                *,
-                categoria ( nombre, icono )
-                """
-            ) \
-            .eq("municipio", user_municipio) \
-            .in_("categoria_id", my_category_ids) \
-            .gte("inicio", now) \
-            .neq("estado", "cancelado") \
-            .order("inicio", desc=False) \
-            .limit(20) \
-            .execute()
-
-        # Devuelve los datos o un array vacío (corrigiendo el error 'null')
-        return events_res.data or []
-
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        print(f"Error inesperado en /events/suggestions: {e}")
-        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
 
 @app.post("/auth/register", status_code=201, response_model=None)
 def register_user(user_data: UserSignUp):
     """
-    Registra un usuario en Supabase Auth (de forma segura con email/pass)
-    y luego crea su perfil público en la tabla 'usuarios' con el carnet.
+    Registra un usuario en Supabase Auth y crea su perfil.
     """
     try:
-        # 1. Crear el usuario en Supabase Auth. La contraseña se hashea aquí.
         auth_response = supabase.auth.sign_up({
             "email": user_data.email,
             "password": user_data.password,
@@ -221,8 +139,6 @@ def register_user(user_data: UserSignUp):
 
         new_user = auth_response.user
 
-        # 2. Si Auth fue exitoso, crea el perfil en tu tabla 'usuarios'.
-        #    El 'id' del perfil DEBE ser el mismo que el 'id' de auth.users.
         profile_data = {
             "id": new_user.id,
             "carnet": user_data.carnet,
@@ -237,8 +153,6 @@ def register_user(user_data: UserSignUp):
         profile_res = supabase.table("usuarios").insert(profile_data).execute()
 
         if profile_res.error:
-            # En un caso real, deberías borrar el usuario de auth si el perfil falla (rollback).
-            # Por ahora, solo lanzamos el error.
             raise HTTPException(status_code=500, detail=f"Usuario de Auth creado, pero falló la creación del perfil: {profile_res.error.message}")
 
         return {"message": "Usuario registrado. Revisa tu email para confirmar la cuenta.", "user": new_user.model_dump()}
