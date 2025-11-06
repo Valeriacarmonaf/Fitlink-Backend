@@ -1,128 +1,180 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import List, Optional
+# src/fitlink_backend/routers/chat.py
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from typing import Optional, List, Any
 from uuid import UUID
-from ..supabase_client import supabase
-from ..models.ChatModels import ChatCreate, MessageCreate, ChatSummary, MessageOut, ChatUser
 from datetime import datetime
 
-router = APIRouter(prefix="/chats", tags=["chats"])
+from ..dependencies import get_current_user
+from ..models.ChatModels import ChatSummary, MessageCreate, MessageOut, ChatUser
+from ..supabase_client import supabase_for_token  # cliente firmado por JWT
 
-# Utilidad temporal: extrae user_id de cabecera (cuando tengas auth real, reemplaza)
-def get_current_user_id(x_user_id: Optional[str] = None):
-    # En producción: valida JWT de Supabase y saca auth.user().id
-    if not x_user_id:
-        # placeholder: quitar cuando integres auth real
-        raise HTTPException(status_code=401, detail="Auth requerida")
-    return x_user_id
+router = APIRouter(prefix="/api/chats", tags=["chats"])
 
-# --------- LISTA DE CHATS DEL USUARIO ---------
-@router.get("", response_model=List[ChatSummary])
-def list_my_chats(user_id: str = Depends(get_current_user_id)):
-    # chats donde soy miembro
-    member_rows = supabase.table("chat_members").select("chat_id").eq("user_id", user_id).execute().data or []
-    if not member_rows: 
-        return []
-    chat_ids = [r["chat_id"] for r in member_rows]
-    chat_rows = supabase.table("chats").select("*").in_("id", chat_ids).order("created_at", desc=True).execute().data
+# ----------------------------- utils -----------------------------
 
-    # último mensaje por chat (simple)
-    summaries: List[ChatSummary] = []
-    for c in chat_rows:
-        last = supabase.table("chat_messages").select("*").eq("chat_id", c["id"]).order("created_at", desc=True).limit(1).execute().data
-        if last:
-            summaries.append(ChatSummary(
-                id=c["id"],
-                title=c.get("title"),
-                is_group=c.get("is_group", False),
-                image_url=c.get("image_url"),
-                last_message=last[0]["content"],
-                last_time=datetime.fromisoformat(last[0]["created_at"].replace("Z","")),
-                unread=0
-            ))
-        else:
-            summaries.append(ChatSummary(
-                id=c["id"],
-                title=c.get("title"),
-                is_group=c.get("is_group", False),
-                image_url=c.get("image_url"),
-                last_message=None,
-                last_time=None,
-                unread=0
-            ))
-    return summaries
+def _parse_dt(v: Optional[str]) -> Optional[datetime]:
+    if not v:
+        return None
+    try:
+        # Acepta ISO con o sin 'Z'
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
-# --------- CREAR CHAT (DM o grupo) ---------
-@router.post("", response_model=ChatSummary)
-def create_chat(payload: ChatCreate, user_id: str = Depends(get_current_user_id)):
-    # crea chat
-    chat_row = supabase.table("chats").insert({
-        "title": payload.title,
-        "is_group": payload.is_group,
-        "created_by": user_id
-    }).execute().data[0]
-
-    # agrega creador + miembros
-    member_ids = set([user_id] + [str(i) for i in payload.member_ids])
-    supabase.table("chat_members").insert([
-        {"chat_id": chat_row["id"], "user_id": mid} for mid in member_ids
-    ]).execute()
-
+def _row_to_chat_summary(r: dict) -> ChatSummary:
+    # r: fila de la vista v_my_chats
     return ChatSummary(
-        id=chat_row["id"],
-        title=chat_row.get("title"),
-        is_group=chat_row.get("is_group", False),
-        image_url=chat_row.get("image_url"),
-        last_message=None,
-        last_time=None,
-        unread=0
+        id=r["chat_id"],
+        title=r.get("title"),
+        is_group=r.get("is_group", False),
+        image_url=None,
+        last_message=r.get("last_message_content"),
+        last_time=_parse_dt(r.get("last_message_at")),
+        unread=0,  # hook para futuros "no leídos"
     )
 
-# --------- LISTAR MENSAJES (paginado) ---------
+def _get_user_id(current_user: Any) -> Optional[str]:
+    if current_user is None:
+        return None
+    if hasattr(current_user, "id") and current_user.id:
+        return str(current_user.id)
+    if isinstance(current_user, dict):
+        return str(current_user.get("id") or current_user.get("user_id") or "")
+    return None
+
+def _bearer(token_header: Optional[str]) -> Optional[str]:
+    if not token_header:
+        return None
+    return token_header.replace("Bearer ", "").strip()
+
+# --------------------------- endpoints ---------------------------
+
+@router.get("", response_model=List[ChatSummary])
+async def list_my_chats(
+    current_user=Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Lista los chats del usuario autenticado usando la vista v_my_chats.
+    Se firma la consulta con el JWT para que RLS (auth.uid()) aplique.
+    """
+    token = _bearer(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta token")
+    sb = supabase_for_token(token)
+
+    res = sb.table("v_my_chats").select("*").order("last_message_at", desc=True).execute()
+    data = res.data or []
+    return [_row_to_chat_summary(r) for r in data]
+
+
 @router.get("/{chat_id}/messages", response_model=List[MessageOut])
-def list_messages(chat_id: UUID, user_id: str = Depends(get_current_user_id),
-                  limit: int = Query(30, ge=1, le=100), before: Optional[str] = None):
-    # verifica membresía
-    is_member = supabase.table("chat_members").select("chat_id").eq("chat_id", str(chat_id)).eq("user_id", user_id).limit(1).execute().data
-    if not is_member:
-        raise HTTPException(status_code=403, detail="No eres miembro de este chat")
+async def list_messages(
+    chat_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    before: Optional[str] = Query(None, description="ISO-8601 para paginar hacia atrás"),
+    current_user=Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Lista mensajes del chat firmando con el JWT del usuario para que RLS aplique.
+    Usa la vista v_chat_messages (o la tabla base) ordenada por created_at DESC.
+    """
+    token = _bearer(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta token")
+    sb = supabase_for_token(token)
 
-    q = supabase.table("chat_messages").select("*").eq("chat_id", str(chat_id)).order("created_at", desc=True)
+    qb = (
+        sb.table("v_chat_messages")
+        .select("*")
+        .eq("chat_id", str(chat_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
     if before:
-        q = q.lt("created_at", before)
-    rows = q.limit(limit).execute().data
+        qb = qb.lt("created_at", before)
 
-    # trae info de usuario (mínima) – si tienes tabla usuarios:
-    msgs: List[MessageOut] = []
-    for r in reversed(rows):  # orden cronológico ascendente en UI
-        u = supabase.table("usuarios").select("id,nombre,foto_url").eq("id", r["user_id"]).limit(1).execute().data
-        user = u[0] if u else {"id": r["user_id"], "nombre": "Usuario", "foto_url": None}
-        msgs.append(MessageOut(
-            id=r["id"], chat_id=r["chat_id"],
-            user=ChatUser(**user),
-            content=r["content"],
-            created_at=datetime.fromisoformat(r["created_at"].replace("Z","")),
-        ))
-    return msgs
+    res = qb.execute()
+    rows = res.data or []
 
-# --------- ENVIAR MENSAJE ---------
-@router.post("/{chat_id}/messages", response_model=MessageOut)
-def send_message(chat_id: UUID, payload: MessageCreate, user_id: str = Depends(get_current_user_id)):
-    is_member = supabase.table("chat_members").select("chat_id").eq("chat_id", str(chat_id)).eq("user_id", user_id).limit(1).execute().data
-    if not is_member:
-        raise HTTPException(status_code=403, detail="No eres miembro de este chat")
+    out: List[MessageOut] = []
+    for r in rows:
+        sender_id = r["user_id"]
+        ures = (
+            sb.table("usuarios")
+            .select("id, nombre, foto_url")
+            .eq("id", str(sender_id))
+            .limit(1)
+            .execute()
+            .data
+        )
+        u = ures[0] if ures else {"id": sender_id, "nombre": "Usuario", "foto_url": None}
+        out.append(
+            MessageOut(
+                id=r["id"],
+                chat_id=r["chat_id"],
+                user=ChatUser(**u),
+                content=r["content"],
+                created_at=_parse_dt(r.get("created_at")),
+            )
+        )
+    return out
 
-    inserted = supabase.table("chat_messages").insert({
+
+@router.post("/{chat_id}/messages", response_model=MessageOut, status_code=201)
+async def send_message(
+    chat_id: UUID,
+    body: MessageCreate,
+    current_user=Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Inserta un mensaje en chat_messages firmando con el JWT del usuario.
+    También asegura la membresía (upsert) antes de insertar, para evitar
+    fallos por RLS si todavía no existía el registro en chat_members.
+    """
+    token = _bearer(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta token")
+    sb = supabase_for_token(token)
+
+    user_id = _get_user_id(current_user)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    # 1) Asegurar membresía idempotente
+    sb.table("chat_members").upsert({
         "chat_id": str(chat_id),
-        "user_id": user_id,
-        "content": payload.content
-    }).execute().data[0]
+        "user_id": str(user_id),
+    }, on_conflict="chat_id,user_id").execute()
 
-    u = supabase.table("usuarios").select("id,nombre,foto_url").eq("id", user_id).limit(1).execute().data
-    user = u[0] if u else {"id": user_id, "nombre": "Yo", "foto_url": None}
+    # 2) Insertar mensaje (compatible con supabase-py 2.x; no usar .single()/.select() encadenado)
+    payload = {
+        "chat_id": str(chat_id),
+        "user_id": str(user_id),  # validado por RLS: user_id = auth.uid()
+        "content": body.content,
+    }
+    ins = sb.table("chat_messages").insert(payload).execute()
+    if not ins.data or len(ins.data) == 0:
+        raise HTTPException(status_code=400, detail="No se pudo insertar el mensaje")
+    inserted = ins.data[0]
+
+    # 3) Perfil básico para la respuesta
+    ures = (
+        sb.table("usuarios")
+        .select("id, nombre, foto_url")
+        .eq("id", str(user_id))
+        .limit(1)
+        .execute()
+        .data
+    )
+    u = ures[0] if ures else {"id": user_id, "nombre": "Yo", "foto_url": None}
 
     return MessageOut(
-        id=inserted["id"], chat_id=inserted["chat_id"],
-        user=ChatUser(**user),
+        id=inserted["id"],
+        chat_id=inserted["chat_id"],
+        user=ChatUser(**u),
         content=inserted["content"],
-        created_at=datetime.fromisoformat(inserted["created_at"].replace("Z","")),
+        created_at=_parse_dt(inserted.get("created_at")),
     )
