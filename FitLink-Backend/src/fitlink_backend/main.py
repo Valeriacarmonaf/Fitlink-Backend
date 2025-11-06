@@ -180,8 +180,41 @@ async def login_user(user_data: UserLogin):
             "user": response.user.model_dump()
         }
     except Exception as e:
-        print(f"Error inesperado en login: {e}")
-        raise HTTPException(status_code=500, detail="Ocurrió un error inesperado en el servidor.")
+        error_message = str(e).lower()
+        
+        # Detectar tipo de error basado en el mensaje
+        if "invalid login credentials" in error_message:
+            raise HTTPException(
+                status_code=401, 
+                detail="Credenciales inválidas: email o contraseña incorrectos"
+            )
+        elif "email not confirmed" in error_message:
+            raise HTTPException(
+                status_code=401,
+                detail="Email no confirmado. Por favor, verifica tu cuenta."
+            )
+        elif "user not found" in error_message or "email not found" in error_message:
+            raise HTTPException(
+                status_code=401,
+                detail="Usuario no encontrado. Verifica tu email."
+            )
+        elif "invalid password" in error_message or "password" in error_message:
+            raise HTTPException(
+                status_code=401,
+                detail="Contraseña incorrecta."
+            )
+        elif "too many requests" in error_message:
+            raise HTTPException(
+                status_code=429,
+                detail="Demasiados intentos fallidos. Por favor, espera unos minutos."
+            )
+        else:
+            # Para errores no reconocidos, mantener el comportamiento original
+            print(f"Error inesperado en login: {e}")
+            raise HTTPException(
+                status_code=500, 
+                detail="Ocurrió un error inesperado en el servidor."
+            )
     
 @app.get("/auth/google", response_model=None)
 async def login_with_google(redirect_to: Optional[str] = None):
