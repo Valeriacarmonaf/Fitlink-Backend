@@ -1,11 +1,16 @@
 # src/fitlink_backend/main.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from typing import Optional
 
 import os
 from dotenv import load_dotenv
+from supabase import create_client, Client
+import datetime
+from fastapi import Depends, Header
+from typing import Annotated
+from typing import Optional, Any
 
 # Routers
 from fitlink_backend.routers import chat as chat_router
@@ -13,8 +18,10 @@ from fitlink_backend.routers import events, stats, suggestions, users
 
 # Modelos y cliente (sólo para los endpoints de auth que permanecen aquí)
 from fitlink_backend.models.UserSignUp import UserSignUp
+from fitlink_backend.models.UserResponse import UserResponse
 from fitlink_backend.models.UserLogin import UserLogin
 from fitlink_backend.supabase_client import supabase
+from fitlink_backend.routers import success_events
 
 load_dotenv()
 
@@ -45,7 +52,7 @@ app.include_router(events.router)           # /api/events
 app.include_router(stats.router)            # /api/stats
 app.include_router(suggestions.router)      # /api/events/suggestions (o el que definas)
 app.include_router(users.router)            # /api/users
-
+app.include_router(success_events.router)
 # Alias útil si alguien llama /stats directo
 @app.get("/stats")
 async def stats_alias():

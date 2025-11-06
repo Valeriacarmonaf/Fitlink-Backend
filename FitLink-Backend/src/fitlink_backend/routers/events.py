@@ -9,13 +9,16 @@ from fitlink_backend.supabase_client import (
     supabase_for_token,    # cliente firmado con JWT
     get_admin_client,      # cliente admin (service role)
 )
-from fitlink_backend.dependencies import get_current_user
+
+# Import del usuario autenticado (soporta nombre español/inglés del archivo)
+from fitlink_backend.dependencies import get_current_user  # <- si se llama 'dependencies.py'
 
 router = APIRouter(prefix="/api/events", tags=["events"])
 
 # ---------------------------------------------------------------------
 # Utilidades
 # ---------------------------------------------------------------------
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -46,7 +49,6 @@ def _uid_from_token(authorization: Optional[str]) -> Optional[str]:
         return None
     try:
         resp = supabase.auth.get_user(token)
-        # resp puede ser objeto con .user o dict en .data
         user = getattr(resp, "user", None) or (getattr(resp, "data", {}) or {}).get("user")
         if isinstance(user, dict):
             return user.get("id")
@@ -54,15 +56,52 @@ def _uid_from_token(authorization: Optional[str]) -> Optional[str]:
     except Exception:
         return None
 
+def _normalize_nivel(nivel: str) -> str:
+    """
+    Mapea 'Principiante|Intermedio|Avanzado' (o minúsculas) al ENUM de BD en minúsculas.
+    """
+    mapping = {
+        "Principiante": "principiante",
+        "Intermedio":   "intermedio",
+        "Avanzado":     "avanzado",
+        "principiante": "principiante",
+        "intermedio":   "intermedio",
+        "avanzado":     "avanzado",
+    }
+    v = mapping.get(nivel)
+    if not v:
+        raise HTTPException(status_code=422, detail="Nivel inválido")
+    return v
+
 # ---------------------------------------------------------------------
 # GETs
 # ---------------------------------------------------------------------
+
 @router.get("/upcoming")
-def upcoming_events(limit: int = Query(20, ge=1, le=100)) -> List[dict]:
+async def upcoming_events(
+    limit: int = Query(20, ge=1, le=100),
+    current_user = Depends(get_current_user),   # ← exige sesión para ver
+) -> List[dict]:
     res = (
         supabase.table("eventos")
         .select("*")
         .gte("inicio", _now_iso())
+        .eq("estado", "activo")
+        .order("inicio", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+@router.get("/latest")
+async def latest_events(
+    limit: int = Query(50, ge=1, le=200),
+    current_user = Depends(get_current_user),   # ← exige sesión para ver
+) -> List[dict]:
+    res = (
+        supabase.table("eventos")
+        .select("*")
+        .eq("estado", "activo")
         .order("inicio", desc=False)
         .limit(limit)
         .execute()
@@ -70,9 +109,10 @@ def upcoming_events(limit: int = Query(20, ge=1, le=100)) -> List[dict]:
     return res.data or []
 
 @router.get("")
-def list_events(
+async def list_events(
     limit: int = Query(50, ge=1, le=200),
-    estado: Optional[str] = None
+    estado: Optional[str] = None,
+    current_user = Depends(get_current_user),   # ← también protegido
 ) -> List[dict]:
     q = supabase.table("eventos").select("*").order("inicio", desc=False).limit(limit)
     if estado:
@@ -81,11 +121,13 @@ def list_events(
     return res.data or []
 
 # ---------------------------------------------------------------------
-# POST /api/events  (creación pública con Authorization opcional)
+# POST /api/events  (crear evento - requiere sesión)
 # ---------------------------------------------------------------------
+
 class EventCreate(BaseModel):
+    # Mantengo tus campos para compatibilidad con tu UI actual
     nombre: str
-    email: EmailStr
+    email: Optional[EmailStr] = None   # ← ignorado en BD; se usa el email del token
     descripcion: str
     categoria: str
     municipio: str
@@ -94,29 +136,42 @@ class EventCreate(BaseModel):
     hora: time           # "HH:MM"
 
 @router.post("", status_code=201)
-async def create_event(payload: EventCreate, authorization: Optional[str] = Header(None)) -> dict:
+async def create_event(
+    payload: EventCreate,
+    current_user = Depends(get_current_user),   # ← exige sesión
+    authorization: Optional[str] = Header(None),
+) -> dict:
     """
-    Crea un evento público (sin login). Combina fecha+hora en 'inicio' (UTC)
-    y guarda en la tabla 'eventos'. Además crea un chat para el evento con cliente admin y, si
-    hay usuario autenticado en el header Authorization, lo añade como participante
-    del evento y del chat (firmado con el JWT para cumplir RLS).
+    Crea un evento (requiere login). Combina fecha+hora en 'inicio' (UTC)
+    y guarda en la tabla 'eventos'. Garantiza chat por evento usando admin si es necesario.
+    Si viene Authorization, inscribe al creador como participante y miembro del chat.
     """
     try:
-        # 1) Combinar fecha + hora en UTC
-        inicio_utc = datetime.combine(payload.fecha, payload.hora).replace(tzinfo=timezone.utc).isoformat()
+        # Email desde el usuario autenticado (no confiamos en payload.email)
+        email = getattr(current_user, "email", None) or (isinstance(current_user, dict) and current_user.get("email"))
+        if not email:
+            raise HTTPException(status_code=401, detail="No se pudo obtener el email del usuario")
+
+        # Validación fecha futura (opcional pero útil)
+        inicio_dt = datetime.combine(payload.fecha, payload.hora).replace(tzinfo=timezone.utc)
+        if inicio_dt < datetime.now(timezone.utc):
+            raise HTTPException(status_code=422, detail="La fecha y hora deben ser futuras")
+
+        # Normaliza nivel al ENUM de BD
+        nivel_db = _normalize_nivel(payload.nivel)
 
         row = {
-            "creador_nombre": payload.nombre,
-            "creador_email": payload.email,
+            "creador_nombre": payload.nombre,  # opcional (si tienes esta columna)
+            "creador_email": email,
             "descripcion": payload.descripcion,
             "categoria": payload.categoria,
             "municipio": payload.municipio,
-            "nivel": payload.nivel,
-            "inicio": inicio_utc,
+            "nivel": nivel_db,
+            "inicio": inicio_dt.isoformat(),
             "estado": "activo",
         }
 
-        # 2) Insertar el evento (público)
+        # 1) Insertar el evento (con cliente público; RLS permitirá insert si hay policy)
         ev_ins = supabase.table("eventos").insert(row).execute()
         data = ev_ins.data or []
         if not data:
@@ -124,25 +179,25 @@ async def create_event(payload: EventCreate, authorization: Optional[str] = Head
         created = data[0]
         evento_id = created.get("id") or created.get("evento_id")
 
-        # 3) Crear chat asociado al evento (ADMIN; evita problemas de RLS/policies)
+        # 2) Crear/garantizar chat asociado al evento (ADMIN; evita problemas de RLS/policies)
         try:
             admin = get_admin_client()
             title = created.get("descripcion") or f"Chat del evento #{evento_id}"
-            admin.table("chats").insert({
+            admin.table("chats").upsert({
                 "evento_id": evento_id,
                 "title": title,
                 "is_group": True,
-            }).execute()
+            }, on_conflict="evento_id").execute()
         except Exception:
-            # best-effort, si ya existe o policy lo impide, seguimos
+            # best-effort; si falla por políticas o ya existe, seguimos
             pass
 
-        # 4) Si viene Authorization, inscribir a quien lo creó como participante y miembro del chat
+        # 3) Si viene Authorization, inscribir a quien lo creó como participante y miembro del chat
         token = _bearer(authorization)
         user_id = _uid_from_token(authorization)
         if token and user_id:
             sb = supabase_for_token(token)
-            # (a) participante del evento (INCLUYENDO user_id para pasar RLS)
+            # (a) participante del evento
             sb.table("event_participants").upsert(
                 {"evento_id": evento_id, "user_id": user_id, "status": "active", "joined_at": _now_iso()},
                 on_conflict="evento_id,user_id",
@@ -150,7 +205,7 @@ async def create_event(payload: EventCreate, authorization: Optional[str] = Head
             # (b) encontrar chat del evento
             chat_row = sb.table("chats").select("id").eq("evento_id", evento_id).limit(1).execute().data or []
             chat_id = chat_row[0]["id"] if chat_row else None
-            # (c) membresía de chat (INCLUYENDO user_id)
+            # (c) membresía del chat
             if chat_id:
                 sb.table("chat_members").upsert(
                     {"chat_id": chat_id, "user_id": user_id, "joined_at": _now_iso()},
@@ -167,6 +222,7 @@ async def create_event(payload: EventCreate, authorization: Optional[str] = Head
 # ---------------------------------------------------------------------
 # Unirse / Dejar evento
 # ---------------------------------------------------------------------
+
 @router.post("/{event_id}/join")
 async def join_event(
     event_id: int,
@@ -205,7 +261,7 @@ async def join_event(
                 "evento_id": event_id,
                 "is_group": True,
                 "title": f"Chat del evento #{event_id}",
-                "created_by": user_id,  # <-- (A) clave: NO nulo
+                "created_by": user_id,
             }).execute().data or []
             chat_id = created[0]["id"] if created else None
         except Exception:
@@ -217,7 +273,7 @@ async def join_event(
                 "evento_id": event_id,
                 "is_group": True,
                 "title": f"Chat del evento #{event_id}",
-                "created_by": user_id,  # <-- (A) clave también con admin
+                "created_by": user_id,
             }).execute().data or []
             if not created:
                 again = sb.table("chats").select("id").eq("evento_id", event_id).limit(1).execute().data or []
@@ -227,13 +283,13 @@ async def join_event(
             else:
                 chat_id = created[0]["id"]
 
-    # 3) upsert participante del evento (RLS, **incluyendo user_id**)
+    # 3) upsert participante del evento
     sb.table("event_participants").upsert(
         {"evento_id": event_id, "user_id": user_id, "status": "active", "joined_at": _now_iso()},
         on_conflict="evento_id,user_id",
     ).execute()
 
-    # 4) upsert membresía del chat (RLS, **incluyendo user_id**)
+    # 4) upsert membresía del chat
     sb.table("chat_members").upsert(
         {"chat_id": chat_id, "user_id": user_id, "joined_at": _now_iso()},
         on_conflict="chat_id,user_id",
