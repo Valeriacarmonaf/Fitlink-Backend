@@ -118,10 +118,6 @@ def delete_user(user_id: int):
         raise HTTPException(status_code=500, detail=res.error.message)
     return {"ok": True}
 
-# --- 4. ENDPOINT /events/suggestions ELIMINADO ---
-# (Ya está en 'suggestions.router' con la lógica de prioridad)
-
-
 @app.post("/auth/register", status_code=201, response_model=None)
 def register_user(user_data: UserSignUp):
     """
