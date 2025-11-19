@@ -28,6 +28,14 @@ def get_admin_client() -> Client:
     si no, cae a ANON. Úsalo con MUCHO cuidado.
     """
     key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
+    # DEBUG: indicate which key type is being used (do not print the key value)
+    try:
+        if SUPABASE_SERVICE_ROLE_KEY:
+            print("[SUPABASE_CLIENT] Using SERVICE_ROLE key for admin client")
+        else:
+            print("[SUPABASE_CLIENT] SERVICE_ROLE key not set, using ANON key for admin client")
+    except Exception:
+        pass
     return create_client(SUPABASE_URL, key)
 
 # Cliente global "admin/anon" para endpoints públicos/simples.

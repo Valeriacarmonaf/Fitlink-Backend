@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fitlink_backend.supabase_client import supabase
-from fitlink_backend.deps.auth import get_current_user_id
+from fitlink_backend.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/chats", tags=["chats"])
 
 @router.post("/match")
-def match_event(event_id: int, user_id: str = Depends(get_current_user_id)):
+def match_event(event_id: int, current_user = Depends(get_current_user)):
+    user_id = current_user.id
     # 1) Busca evento
     ev = supabase.table("eventos").select("id, creador_id").eq("id", event_id).single().execute()
     if not ev.data:
