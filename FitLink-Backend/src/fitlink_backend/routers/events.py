@@ -1,7 +1,7 @@
 # src/fitlink_backend/routers/events.py
 from fastapi import APIRouter, HTTPException, Query, Header, Depends
 from typing import List, Optional, Literal
-from datetime import datetime, timezone, date, time
+from datetime import datetime, timezone, date, time, timedelta
 from pydantic import BaseModel, EmailStr
 
 from fitlink_backend.supabase_client import (
@@ -80,7 +80,6 @@ def _normalize_nivel(nivel: str) -> str:
 @router.get("/upcoming")
 async def upcoming_events(
     limit: int = Query(20, ge=1, le=100),
-    current_user = Depends(get_current_user),   # ← exige sesión para ver
 ) -> List[dict]:
     res = (
         supabase.table("eventos")
@@ -96,7 +95,6 @@ async def upcoming_events(
 @router.get("/latest")
 async def latest_events(
     limit: int = Query(50, ge=1, le=200),
-    current_user = Depends(get_current_user),   # ← exige sesión para ver
 ) -> List[dict]:
     res = (
         supabase.table("eventos")
@@ -112,7 +110,6 @@ async def latest_events(
 async def list_events(
     limit: int = Query(50, ge=1, le=200),
     estado: Optional[str] = None,
-    current_user = Depends(get_current_user),   # ← también protegido
 ) -> List[dict]:
     q = supabase.table("eventos").select("*").order("inicio", desc=False).limit(limit)
     if estado:
@@ -138,7 +135,7 @@ class EventCreate(BaseModel):
 @router.post("", status_code=201)
 async def create_event(
     payload: EventCreate,
-    current_user = Depends(get_current_user),   # ← exige sesión
+    current_user = Depends(get_current_user),
     authorization: Optional[str] = Header(None),
 ) -> dict:
     """
@@ -147,31 +144,59 @@ async def create_event(
     Si viene Authorization, inscribe al creador como participante y miembro del chat.
     """
     try:
-        # Email desde el usuario autenticado (no confiamos en payload.email)
-        email = getattr(current_user, "email", None) or (isinstance(current_user, dict) and current_user.get("email"))
+        # 1) Email desde el usuario autenticado
+        email = getattr(current_user, "email", None) or (
+            isinstance(current_user, dict) and current_user.get("email")
+        )
         if not email:
             raise HTTPException(status_code=401, detail="No se pudo obtener el email del usuario")
 
-        # Validación fecha futura (opcional pero útil)
+        # 2) Validación fecha futura
         inicio_dt = datetime.combine(payload.fecha, payload.hora).replace(tzinfo=timezone.utc)
         if inicio_dt < datetime.now(timezone.utc):
             raise HTTPException(status_code=422, detail="La fecha y hora deben ser futuras")
 
-        # Normaliza nivel al ENUM de BD
-        nivel_db = _normalize_nivel(payload.nivel)
+        fin_dt = inicio_dt + timedelta(hours=1)  # por ahora duración fija de 1h
 
+        # 3) Validar/normalizar nivel (aunque no lo guardemos todavía)
+        _ = _normalize_nivel(payload.nivel)
+
+        # 4) Intentar obtener id de categoría a partir del nombre
+        categoria_id = None
+        try:
+            cat_res = (
+                supabase
+                .table("categoria")
+                .select("id")
+                .eq("nombre", payload.categoria)
+                .limit(1)
+                .execute()
+            )
+            cat_rows = cat_res.data or []
+            if cat_rows:
+                categoria_id = cat_rows[0]["id"]
+        except Exception:
+            categoria_id = None
+
+        # Si no se consigue la categoría, usar 1 como fallback
+        if categoria_id is None:
+            categoria_id = 1
+
+        # 5) Fila que se inserta en 'eventos'
         row = {
-            "creador_nombre": payload.nombre,  # opcional (si tienes esta columna)
-            "creador_email": email,
+            "categoria": categoria_id,
+            "nombre_evento": payload.nombre,
             "descripcion": payload.descripcion,
-            "categoria": payload.categoria,
-            "municipio": payload.municipio,
-            "nivel": nivel_db,
             "inicio": inicio_dt.isoformat(),
+            "fin": fin_dt.isoformat(),
+            "cupos": 10,                        # valor por defecto
+            "municipio": payload.municipio or "Caracas",
+            "precio": 0.0,                      # por ahora eventos gratuitos
             "estado": "activo",
+            "creador_email": email,
         }
 
-        # 1) Insertar el evento (con cliente público; RLS permitirá insert si hay policy)
+        # 6) Insertar el evento
         ev_ins = supabase.table("eventos").insert(row).execute()
         data = ev_ins.data or []
         if not data:
@@ -179,36 +204,55 @@ async def create_event(
         created = data[0]
         evento_id = created.get("id") or created.get("evento_id")
 
-        # 2) Crear/garantizar chat asociado al evento (ADMIN; evita problemas de RLS/policies)
+        # 7) Crear/garantizar chat asociado al evento (como ya lo tenías)
         try:
             admin = get_admin_client()
             title = created.get("descripcion") or f"Chat del evento #{evento_id}"
-            admin.table("chats").upsert({
-                "evento_id": evento_id,
-                "title": title,
-                "is_group": True,
-            }, on_conflict="evento_id").execute()
+            admin.table("chats").upsert(
+                {
+                    "evento_id": evento_id,
+                    "title": title,
+                    "is_group": True,
+                },
+                on_conflict="evento_id",
+            ).execute()
         except Exception:
-            # best-effort; si falla por políticas o ya existe, seguimos
             pass
 
-        # 3) Si viene Authorization, inscribir a quien lo creó como participante y miembro del chat
+        # 8) Inscribir al creador como participante y miembro del chat
         token = _bearer(authorization)
         user_id = _uid_from_token(authorization)
         if token and user_id:
             sb = supabase_for_token(token)
-            # (a) participante del evento
+
             sb.table("event_participants").upsert(
-                {"evento_id": evento_id, "user_id": user_id, "status": "active", "joined_at": _now_iso()},
+                {
+                    "evento_id": evento_id,
+                    "user_id": user_id,
+                    "status": "active",
+                    "joined_at": _now_iso(),
+                },
                 on_conflict="evento_id,user_id",
             ).execute()
-            # (b) encontrar chat del evento
-            chat_row = sb.table("chats").select("id").eq("evento_id", evento_id).limit(1).execute().data or []
+
+            chat_row = (
+                sb.table("chats")
+                .select("id")
+                .eq("evento_id", evento_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
             chat_id = chat_row[0]["id"] if chat_row else None
-            # (c) membresía del chat
+
             if chat_id:
                 sb.table("chat_members").upsert(
-                    {"chat_id": chat_id, "user_id": user_id, "joined_at": _now_iso()},
+                    {
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "joined_at": _now_iso(),
+                    },
                     on_conflict="chat_id,user_id",
                 ).execute()
 
