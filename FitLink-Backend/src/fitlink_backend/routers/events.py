@@ -1,77 +1,212 @@
-# src/fitlink_backend/routers/events.py
-
 from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional, Literal
+from typing import List, Optional
 from datetime import datetime, timezone, date, time
 from pydantic import BaseModel, EmailStr
 from fitlink_backend.supabase_client import supabase
 
+# Importar función para crear notificaciones
+from fitlink_backend.routes.notificaciones import enviar_notificacion
+
 router = APIRouter(prefix="/api/events", tags=["events"])
 
+
+# --------------------- Helpers ---------------------
+
 def _now_iso():
+    """Retorna la hora actual en ISO UTC"""
     return datetime.now(timezone.utc).isoformat()
 
-# ---------- GETs que ya tienes ----------
+
+# --------------------- Modelos ---------------------
+
+class EventCreate(BaseModel):
+    nombre_evento: str
+    descripcion: Optional[str] = None
+    categoria: int               # BIGINT en tu tabla
+    municipio: str
+    fecha: date
+    hora: time
+    creador_email: EmailStr
+
+
+# --------------------- GET -------------------------
+
 @router.get("/upcoming")
 def upcoming_events(limit: int = Query(20, ge=1, le=100)) -> List[dict]:
-    res = (supabase.table("eventos")
-           .select("*")
-           .gte("inicio", _now_iso())
-           .order("inicio", desc=False)
-           .limit(limit)
-           .execute())
+    res = (
+        supabase.table("eventos")
+        .select("*")
+        .gte("inicio", _now_iso())
+        .neq("estado", "cancelado")
+        .order("inicio", desc=False)
+        .limit(limit)
+        .execute()
+    )
     return res.data or []
 
+
 @router.get("")
-def list_events(limit: int = Query(50, ge=1, le=200),
-                estado: Optional[str] = None) -> List[dict]:
-    q = supabase.table("eventos").select("*").order("inicio", desc=False).limit(limit)
+def list_events(
+    limit: int = Query(50, ge=1, le=200),
+    estado: Optional[str] = None
+) -> List[dict]:
+
+    q = (
+        supabase.table("eventos")
+        .select("*")
+        .order("inicio", desc=False)
+        .limit(limit)
+    )
+
     if estado:
         q = q.eq("estado", estado)
+
     res = q.execute()
     return res.data or []
 
-# ---------- 🔥 NUEVO: POST /api/events ----------
-class EventCreate(BaseModel):
-    nombre: str
-    email: EmailStr
-    descripcion: str
-    categoria: str
-    municipio: str
-    nivel: Literal["Principiante", "Intermedio", "Avanzado"]
-    fecha: date          # "YYYY-MM-DD"
-    hora: time           # "HH:MM"
+
+# --------------------- POST: Crear Evento -------------------------
 
 @router.post("", status_code=201)
-def create_event(payload: EventCreate) -> dict:
-    """
-    Crea un evento público (sin login). Combina fecha+hora en 'inicio' (UTC)
-    y guarda en la tabla 'eventos'.
-    """
-    try:
-        # Combinar fecha + hora y guardarlo en UTC ISO8601
-        inicio_utc = datetime.combine(payload.fecha, payload.hora).replace(tzinfo=timezone.utc).isoformat()
+def create_event(payload: EventCreate):
 
-        # Ajusta estos nombres si tu tabla usa otros campos
+    try:
+        # Convertir fecha + hora a UTC ISO8601
+        inicio_utc = datetime.combine(payload.fecha, payload.hora) \
+            .replace(tzinfo=timezone.utc).isoformat()
+
         row = {
-            "creador_nombre": payload.nombre,      # <-- cambia a tu columna real si difiere
-            "creador_email": payload.email,        # idem
-            "descripcion": payload.descripcion,    # o 'nombre_evento' si así la tienes
+            "nombre_evento": payload.nombre_evento,
+            "descripcion": payload.descripcion,
             "categoria": payload.categoria,
             "municipio": payload.municipio,
-            "nivel": payload.nivel,
             "inicio": inicio_utc,
             "estado": "activo",
+            "creador_email": payload.creador_email
         }
 
         res = supabase.table("eventos").insert(row).execute()
-        data = (res.data or [])
+
+        data = res.data or []
         if not data:
-            raise HTTPException(status_code=400, detail="No se pudo crear el evento.")
-        return data[0]
+            raise HTTPException(400, "No se pudo crear el evento")
+
+        evento = data[0]
+
+        # Buscar id del usuario creador
+        ures = (
+            supabase.table("usuarios")
+            .select("id")
+            .eq("email", payload.creador_email)
+            .maybe_single()
+            .execute()
+        )
+
+        if ures.data:
+            enviar_notificacion(
+                usuario_id=ures.data["id"],
+                titulo="Evento creado",
+                mensaje=f"Tu evento '{evento['nombre_evento']}' ha sido creado.",
+                tipo="entreno"
+            )
+
+        return evento
 
     except HTTPException:
         raise
     except Exception as e:
-        # Útil en desarrollo; en prod podrías loguear el error
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, detail=str(e))
+
+
+# --------------------- PUT: Confirmar Evento ---------------------
+
+@router.put("/{event_id}/confirmar")
+def confirmar_evento(event_id: int):
+
+    try:
+        res = (
+            supabase.table("eventos")
+            .select("*")
+            .eq("id", event_id)
+            .single()
+            .execute()
+        )
+
+        evento = res.data
+        if not evento:
+            raise HTTPException(404, "Evento no encontrado")
+
+        supabase.table("eventos").update(
+            {"estado": "confirmado"}
+        ).eq("id", event_id).execute()
+
+        # Notificar
+        creador_email = evento["creador_email"]
+
+        ures = (
+            supabase.table("usuarios")
+            .select("id")
+            .eq("email", creador_email)
+            .maybe_single()
+            .execute()
+        )
+
+        if ures.data:
+            enviar_notificacion(
+                usuario_id=ures.data["id"],
+                titulo="Entrenamiento confirmado",
+                mensaje=f"Tu entrenamiento '{evento['nombre_evento']}' ha sido confirmado.",
+                tipo="match"
+            )
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+# --------------------- PUT: Cancelar Evento ----------------------
+
+@router.put("/{event_id}/cancelar")
+def cancelar_evento(event_id: int):
+
+    try:
+        res = (
+            supabase.table("eventos")
+            .select("*")
+            .eq("id", event_id)
+            .single()
+            .execute()
+        )
+
+        evento = res.data
+        if not evento:
+            raise HTTPException(404, "Evento no encontrado")
+
+        supabase.table("eventos").update(
+            {"estado": "cancelado"}
+        ).eq("id", event_id).execute()
+
+        creador_email = evento["creador_email"]
+
+        ures = (
+            supabase.table("usuarios")
+            .select("id")
+            .eq("email", creador_email)
+            .maybe_single()
+            .execute()
+        )
+
+        if ures.data:
+            enviar_notificacion(
+                usuario_id=ures.data["id"],
+                titulo="Entrenamiento cancelado",
+                mensaje=f"Tu entrenamiento '{evento['nombre_evento']}' ha sido cancelado.",
+                tipo="entreno"
+            )
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
