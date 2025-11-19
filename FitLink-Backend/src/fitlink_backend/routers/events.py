@@ -1,5 +1,8 @@
 # src/fitlink_backend/routers/events.py
 from fastapi import APIRouter, HTTPException, Query, Header, Depends
+import time as pytime
+import httpx
+import httpcore
 from typing import List, Optional, Literal
 from datetime import datetime, timezone, date, time
 from pydantic import BaseModel, EmailStr
@@ -21,6 +24,29 @@ router = APIRouter(prefix="/api/events", tags=["events"])
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_exec(callable_fn, retries: int = 1):
+    """
+    Ejecuta `callable_fn()` (debe devolver el objeto que retorna `.execute()`),
+    atrapando errores de lectura/timeout de httpx/httpcore. Reintenta `retries`
+    veces antes de elevar HTTPException con 502 (bad gateway) para indicar
+    problema con PostgREST/Supabase.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return callable_fn()
+        except (httpx.ReadTimeout, httpx.ReadError, httpcore.ReadTimeout, httpcore.ReadError) as e:
+            last_exc = e
+            if attempt == retries:
+                raise HTTPException(status_code=502, detail="Error de conexión con servicio de datos (PostgREST).") from e
+            # backoff corto
+            pytime.sleep(0.15 * (attempt + 1))
+        except Exception as e:
+            # otros errores (p. ej. APIError) propagamos como 500 con detalle
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
 
 def _user_id_from(current_user) -> str:
     """
@@ -82,7 +108,7 @@ async def upcoming_events(
     limit: int = Query(20, ge=1, le=100),
     current_user = Depends(get_current_user),   # ← exige sesión para ver
 ) -> List[dict]:
-    res = (
+    res = _safe_exec(lambda: (
         supabase.table("eventos")
         .select("*")
         .gte("inicio", _now_iso())
@@ -90,7 +116,7 @@ async def upcoming_events(
         .order("inicio", desc=False)
         .limit(limit)
         .execute()
-    )
+    ))
     return res.data or []
 
 @router.get("/latest")
@@ -98,14 +124,14 @@ async def latest_events(
     limit: int = Query(50, ge=1, le=200),
     current_user = Depends(get_current_user),   # ← exige sesión para ver
 ) -> List[dict]:
-    res = (
+    res = _safe_exec(lambda: (
         supabase.table("eventos")
         .select("*")
         .eq("estado", "activo")
         .order("inicio", desc=False)
         .limit(limit)
         .execute()
-    )
+    ))
     return res.data or []
 
 @router.get("")
@@ -114,10 +140,10 @@ async def list_events(
     estado: Optional[str] = None,
     current_user = Depends(get_current_user),   # ← también protegido
 ) -> List[dict]:
-    q = supabase.table("eventos").select("*").order("inicio", desc=False).limit(limit)
+    q_builder = lambda: (supabase.table("eventos").select("*").order("inicio", desc=False).limit(limit))
     if estado:
-        q = q.eq("estado", estado)
-    res = q.execute()
+        q_builder = lambda: (supabase.table("eventos").select("*").order("inicio", desc=False).limit(limit).eq("estado", estado))
+    res = _safe_exec(lambda: q_builder().execute())
     return res.data or []
 
 # ---------------------------------------------------------------------
@@ -269,19 +295,32 @@ async def join_event(
 
         if not chat_id:
             admin = get_admin_client()
-            created = admin.table("chats").insert({
-                "evento_id": event_id,
-                "is_group": True,
-                "title": f"Chat del evento #{event_id}",
-                "created_by": user_id,
-            }).execute().data or []
-            if not created:
-                again = sb.table("chats").select("id").eq("evento_id", event_id).limit(1).execute().data or []
-                if not again:
-                    raise HTTPException(status_code=500, detail="No se pudo crear ni recuperar el chat del evento")
-                chat_id = again[0]["id"]
-            else:
-                chat_id = created[0]["id"]
+            try:
+                created = admin.table("chats").insert({
+                    "evento_id": event_id,
+                    "is_group": True,
+                    "title": f"Chat del evento #{event_id}",
+                    "created_by": user_id,
+                }).execute().data or []
+                if created:
+                    chat_id = created[0]["id"]
+                else:
+                    # si la inserción no devolvió fila, intentamos recuperar
+                    again = admin.table("chats").select("id").eq("evento_id", event_id).limit(1).execute().data or []
+                    if not again:
+                        raise HTTPException(status_code=500, detail="No se pudo crear ni recuperar el chat del evento")
+                    chat_id = again[0]["id"]
+            except Exception as e:
+                # Manejar caso de inserciones concurrentes que produzcan clave única duplicada
+                msg = str(e)
+                if 'duplicate key value violates unique constraint' in msg or '23505' in msg:
+                    again = admin.table("chats").select("id").eq("evento_id", event_id).limit(1).execute().data or []
+                    if again:
+                        chat_id = again[0]["id"]
+                    else:
+                        raise HTTPException(status_code=500, detail="Conflicto al crear chat y no se pudo recuperar el registro")
+                else:
+                    raise HTTPException(status_code=500, detail=f"No se pudo crear ni recuperar el chat del evento: {str(e)}")
 
     # 3) upsert participante del evento
     sb.table("event_participants").upsert(
@@ -296,6 +335,7 @@ async def join_event(
     ).execute()
 
     return {"ok": True, "event_id": event_id, "chat_id": chat_id}
+
 
 @router.post("/{event_id}/leave")
 async def leave_event(
