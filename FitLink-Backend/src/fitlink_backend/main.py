@@ -1,88 +1,94 @@
-from fastapi import FastAPI, HTTPException, Body
-from supabase import create_client, Client
+from fastapi import FastAPI, HTTPException, Body, Header
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Annotated, Any, Optional
 from dotenv import load_dotenv
 import os
 import datetime
-from fastapi.middleware.cors import CORSMiddleware
-from fitlink_backend.routers.chat import router as chat_router
-from fastapi import Depends, Header
-from typing import Annotated
-from typing import Optional, Any
 
-# Rutas
+# Supabase client
+from fitlink_backend.supabase_client import supabase
+
+# Routers
 from fitlink_backend.routers import events
 from fitlink_backend.routers import stats
 from fitlink_backend.routers import suggestions
 from fitlink_backend.routers import users
+from fitlink_backend.routers.chat import router as chat_router
+from fitlink_backend.routes import notificaciones
 
-# Modelos
+# Modelos para auth
 from fitlink_backend.models.UserSignUp import UserSignUp
-from fitlink_backend.models.UserResponse import UserResponse
 from fitlink_backend.models.UserLogin import UserLogin
-
-from fitlink_backend.supabase_client import supabase
 
 load_dotenv()
 
 app = FastAPI(title="FitLink Backend")
 
+# ---------------------------------------------------------
+# CORS
+# ---------------------------------------------------------
 origins = [
     "http://localhost:5173",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # <-- Usa la lista de orígenes
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],      # Permite todos los métodos (GET, POST, etc.)
-    allow_headers=["*"],      # Permite todas las cabeceras
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# ---------------------------------------------------------
+# Routers
+# ---------------------------------------------------------
 app.include_router(events.router)
 app.include_router(stats.router)
-#app.include_router(chat.router)
 app.include_router(suggestions.router)
-app.include_router(users.router) # <-- 2. INCLUIDO EL NUEVO ROUTER DE USUARIOS
+app.include_router(users.router)
+app.include_router(chat_router)
+app.include_router(notificaciones.router)
 
+# ---------------------------------------------------------
+# Dependencias
+# ---------------------------------------------------------
 async def get_current_user(authorization: Annotated[str | None, Header()] = None) -> Any:
-    """
-    Dependencia de FastAPI para obtener el usuario autenticado...
-    """
-    # (Esta función la movimos a dependencies.py, pero 
-    # la mantenemos aquí si prefieres no crear ese archivo)
     if not authorization:
         raise HTTPException(status_code=401, detail="Falta el encabezado de autorización")
-    
+
     token = authorization.replace("Bearer ", "")
     if not token:
         raise HTTPException(status_code=401, detail="Token malformado")
 
     try:
         user_response = supabase.auth.get_user(token)
-        
+
         if user_response.user is None:
             raise HTTPException(status_code=401, detail="Token inválido o sesión expirada")
-        
-        # Sigue devolviendo el objeto 'user' completo
-        return user_response.user 
-    
+
+        return user_response.user
+
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Error de autenticación: {str(e)}")
 
+
+# ---------------------------------------------------------
+# Health Check
+# ---------------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# --- 3. ENDPOINT /stats ELIMINADO ---
-# (Ya está en 'stats.router')
 
+# ---------------------------------------------------------
+# Eventos públicos (se quedan aquí porque los usas desde el landing)
+# ---------------------------------------------------------
 @app.get("/events/upcoming")
 def events_upcoming(limit: int = 20):
-    import datetime
     try:
         res = (
             supabase.table("eventos")
-            .select("*, categoria ( nombre, icono )") # <-- Actualizado para usar la FK
+            .select("*, categoria ( nombre, icono )")
             .neq("estado", "cancelado")
             .gte("inicio", datetime.datetime.utcnow().isoformat())
             .order("inicio", desc=False)
@@ -93,13 +99,19 @@ def events_upcoming(limit: int = 20):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ---------------------------------------------------------
+# CRUD simple de usuarios (manteniendo tus endpoints legacy)
+# ---------------------------------------------------------
 @app.get("/users")
 def list_users():
     res = supabase.table("usuarios").select(
         "id,nombre,biografia,fecha_nacimiento,municipio,foto_url"
     ).order("nombre").execute()
+    
     if getattr(res, "error", None):
         raise HTTPException(status_code=500, detail=str(res.error))
+
     return res.data or []
 
 
@@ -118,15 +130,12 @@ def delete_user(user_id: int):
         raise HTTPException(status_code=500, detail=res.error.message)
     return {"ok": True}
 
-# --- 4. ENDPOINT /events/suggestions ELIMINADO ---
-# (Ya está en 'suggestions.router' con la lógica de prioridad)
 
-
-@app.post("/auth/register", status_code=201, response_model=None)
+# ---------------------------------------------------------
+# Auth: Registro
+# ---------------------------------------------------------
+@app.post("/auth/register", status_code=201)
 def register_user(user_data: UserSignUp):
-    """
-    Registra un usuario en Supabase Auth y crea su perfil.
-    """
     try:
         auth_response = supabase.auth.sign_up({
             "email": user_data.email,
@@ -153,21 +162,27 @@ def register_user(user_data: UserSignUp):
         profile_res = supabase.table("usuarios").insert(profile_data).execute()
 
         if profile_res.error:
-            raise HTTPException(status_code=500, detail=f"Usuario de Auth creado, pero falló la creación del perfil: {profile_res.error.message}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Usuario de Auth creado, pero falló la creación del perfil: {profile_res.error.message}"
+            )
 
-        return {"message": "Usuario registrado. Revisa tu email para confirmar la cuenta.", "user": new_user.model_dump()}
+        return {
+            "message": "Usuario registrado. Revisa tu email.",
+            "user": new_user.model_dump()
+        }
 
-    except HTTPException as e:
-        raise e
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/auth/login", response_model=None)
+# ---------------------------------------------------------
+# Auth: Login
+# ---------------------------------------------------------
+@app.post("/auth/login")
 async def login_user(user_data: UserLogin):
-    """
-    Inicia sesión de un usuario únicamente con su email y contraseña.
-    """
     try:
         response = supabase.auth.sign_in_with_password({
             "email": str(user_data.email),
@@ -179,54 +194,34 @@ async def login_user(user_data: UserLogin):
             "session": response.session.model_dump(),
             "user": response.user.model_dump()
         }
+
     except Exception as e:
         error_message = str(e).lower()
-        
-        # Detectar tipo de error basado en el mensaje
+
         if "invalid login credentials" in error_message:
-            raise HTTPException(
-                status_code=401, 
-                detail="Credenciales inválidas: email o contraseña incorrectos"
-            )
-        elif "email not confirmed" in error_message:
-            raise HTTPException(
-                status_code=401,
-                detail="Email no confirmado. Por favor, verifica tu cuenta."
-            )
-        elif "user not found" in error_message or "email not found" in error_message:
-            raise HTTPException(
-                status_code=401,
-                detail="Usuario no encontrado. Verifica tu email."
-            )
-        elif "invalid password" in error_message or "password" in error_message:
-            raise HTTPException(
-                status_code=401,
-                detail="Contraseña incorrecta."
-            )
-        elif "too many requests" in error_message:
-            raise HTTPException(
-                status_code=429,
-                detail="Demasiados intentos fallidos. Por favor, espera unos minutos."
-            )
-        else:
-            # Para errores no reconocidos, mantener el comportamiento original
-            print(f"Error inesperado en login: {e}")
-            raise HTTPException(
-                status_code=500, 
-                detail="Ocurrió un error inesperado en el servidor."
-            )
-    
-@app.get("/auth/google", response_model=None)
+            raise HTTPException(401, "Credenciales inválidas")
+        if "email not confirmed" in error_message:
+            raise HTTPException(401, "Email no confirmado")
+        if "user not found" in error_message:
+            raise HTTPException(401, "Usuario no encontrado")
+        if "invalid password" in error_message:
+            raise HTTPException(401, "Contraseña incorrecta")
+        if "too many requests" in error_message:
+            raise HTTPException(429, "Demasiados intentos, espera unos minutos")
+
+        raise HTTPException(500, "Error inesperado")
+
+
+# ---------------------------------------------------------
+# Auth: Login con Google
+# ---------------------------------------------------------
+@app.get("/auth/google")
 async def login_with_google(redirect_to: Optional[str] = None):
-    """
-    Genera y devuelve la URL de Supabase para iniciar sesión con Google.
-    """
-    final_redirect_to = redirect_to if redirect_to else os.environ["VITE_API_URL"]
-    
+    final_redirect_to = redirect_to or os.environ["VITE_API_URL"]
+
     supabase_google_oauth_url = (
         f"{os.environ['SUPABASE_URL']}/auth/v1/authorize?"
-        f"provider=google&"
-        f"redirect_to={final_redirect_to}"
+        f"provider=google&redirect_to={final_redirect_to}"
     )
-    
+
     return {"oauth_url": supabase_google_oauth_url}
