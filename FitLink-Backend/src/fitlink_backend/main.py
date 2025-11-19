@@ -10,10 +10,7 @@ from typing import Annotated
 from typing import Optional, Any
 
 # Rutas
-from fitlink_backend.routers import events
-from fitlink_backend.routers import stats
-from fitlink_backend.routers import suggestions
-from fitlink_backend.routers import users
+from fitlink_backend.routers import events, stats, suggestions, users, intereses
 
 # Modelos
 from fitlink_backend.models.UserSignUp import UserSignUp
@@ -28,6 +25,7 @@ app = FastAPI(title="FitLink Backend")
 
 origins = [
     "http://localhost:5173",
+    "http://localhost:5174"
 ]
 
 app.add_middleware(
@@ -40,9 +38,9 @@ app.add_middleware(
 
 app.include_router(events.router)
 app.include_router(stats.router)
-#app.include_router(chat.router)
+app.include_router(intereses.router)
 app.include_router(suggestions.router)
-app.include_router(users.router) # <-- 2. INCLUIDO EL NUEVO ROUTER DE USUARIOS
+app.include_router(users.router) 
 
 async def get_current_user(authorization: Annotated[str | None, Header()] = None) -> Any:
     """
