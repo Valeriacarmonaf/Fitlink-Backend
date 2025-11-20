@@ -1,211 +1,372 @@
-from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional
+# src/fitlink_backend/routers/events.py
+from fastapi import APIRouter, HTTPException, Query, Header, Depends
+import time as pytime
+import httpx
+import httpcore
+from typing import List, Optional, Literal
 from datetime import datetime, timezone, date, time
 from pydantic import BaseModel, EmailStr
-from fitlink_backend.supabase_client import supabase
+
+from fitlink_backend.supabase_client import (
+    supabase,              # cliente público (anon)
+    supabase_for_token,    # cliente firmado con JWT
+    get_admin_client,      # cliente admin (service role)
+)
+
+# Import del usuario autenticado (soporta nombre español/inglés del archivo)
+from fitlink_backend.dependencies import get_current_user  # <- si se llama 'dependencies.py'
 
 # Importar función para crear notificaciones
 from fitlink_backend.routers.notificaciones import enviar_notificacion
 
 router = APIRouter(prefix="/api/events", tags=["events"])
 
+# ---------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------
 
-# --------------------- Helpers ---------------------
-
-def _now_iso():
-    """Retorna la hora actual en ISO UTC"""
+def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# --------------------- Modelos ---------------------
+def _safe_exec(callable_fn, retries: int = 1):
+    """
+    Ejecuta `callable_fn()` (debe devolver el objeto que retorna `.execute()`),
+    atrapando errores de lectura/timeout de httpx/httpcore. Reintenta `retries`
+    veces antes de elevar HTTPException con 502 (bad gateway) para indicar
+    problema con PostgREST/Supabase.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return callable_fn()
+        except (httpx.ReadTimeout, httpx.ReadError, httpcore.ReadTimeout, httpcore.ReadError) as e:
+            last_exc = e
+            if attempt == retries:
+                raise HTTPException(status_code=502, detail="Error de conexión con servicio de datos (PostgREST).") from e
+            # backoff corto
+            pytime.sleep(0.15 * (attempt + 1))
+        except Exception as e:
+            # otros errores (p. ej. APIError) propagamos como 500 con detalle
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
-class EventCreate(BaseModel):
-    nombre_evento: str
-    descripcion: Optional[str] = None
-    categoria: int               # BIGINT en tu tabla
-    municipio: str
-    fecha: date
-    hora: time
-    creador_email: EmailStr
 
+def _user_id_from(current_user) -> str:
+    """
+    Extrae el id del usuario ya sea que 'current_user' sea el objeto User de Supabase
+    o un dict. Lanza 401 si no puede obtenerse.
+    """
+    uid = getattr(current_user, "id", None)
+    if not uid and isinstance(current_user, dict):
+        uid = current_user.get("id")
+    if not uid:
+        raise HTTPException(status_code=401, detail="No se pudo obtener el id del usuario")
+    return str(uid)
 
-# --------------------- GET -------------------------
+def _bearer(token_header: Optional[str]) -> Optional[str]:
+    if not token_header:
+        return None
+    return token_header.replace("Bearer ", "").strip()
+
+def _uid_from_token(authorization: Optional[str]) -> Optional[str]:
+    """
+    Devuelve el user_id (UUID) del JWT pasado en Authorization.
+    Usa el cliente público para decodificar el token.
+    """
+    token = _bearer(authorization)
+    if not token:
+        return None
+    try:
+        resp = supabase.auth.get_user(token)
+        user = getattr(resp, "user", None) or (getattr(resp, "data", {}) or {}).get("user")
+        if isinstance(user, dict):
+            return user.get("id")
+        return getattr(user, "id", None)
+    except Exception:
+        return None
+
+def _normalize_nivel(nivel: str) -> str:
+    """
+    Mapea 'Principiante|Intermedio|Avanzado' (o minúsculas) al ENUM de BD en minúsculas.
+    """
+    mapping = {
+        "Principiante": "principiante",
+        "Intermedio":   "intermedio",
+        "Avanzado":     "avanzado",
+        "principiante": "principiante",
+        "intermedio":   "intermedio",
+        "avanzado":     "avanzado",
+    }
+    v = mapping.get(nivel)
+    if not v:
+        raise HTTPException(status_code=422, detail="Nivel inválido")
+    return v
+
+# ---------------------------------------------------------------------
+# GETs
+# ---------------------------------------------------------------------
 
 @router.get("/upcoming")
-def upcoming_events(limit: int = Query(20, ge=1, le=100)) -> List[dict]:
-    res = (
+async def upcoming_events(
+    limit: int = Query(20, ge=1, le=100),
+    current_user = Depends(get_current_user),   # ← exige sesión para ver
+) -> List[dict]:
+    res = _safe_exec(lambda: (
         supabase.table("eventos")
         .select("*")
         .gte("inicio", _now_iso())
-        .neq("estado", "cancelado")
+        .eq("estado", "activo")
         .order("inicio", desc=False)
         .limit(limit)
         .execute()
-    )
+    ))
+    return res.data or []
+
+@router.get("/latest")
+async def latest_events(
+    limit: int = Query(50, ge=1, le=200),
+    current_user = Depends(get_current_user),   # ← exige sesión para ver
+) -> List[dict]:
+    res = _safe_exec(lambda: (
+        supabase.table("eventos")
+        .select("*")
+        .eq("estado", "activo")
+        .order("inicio", desc=False)
+        .limit(limit)
+        .execute()
+    ))
     return res.data or []
 
 
 @router.get("")
-def list_events(
+async def list_events(
     limit: int = Query(50, ge=1, le=200),
-    estado: Optional[str] = None
+    estado: Optional[str] = None,
+    current_user = Depends(get_current_user),   # ← también protegido
 ) -> List[dict]:
-
-    q = (
-        supabase.table("eventos")
-        .select("*")
-        .order("inicio", desc=False)
-        .limit(limit)
-    )
-
+    q_builder = lambda: (supabase.table("eventos").select("*").order("inicio", desc=False).limit(limit))
     if estado:
-        q = q.eq("estado", estado)
-
-    res = q.execute()
+        q_builder = lambda: (supabase.table("eventos").select("*").order("inicio", desc=False).limit(limit).eq("estado", estado))
+    res = _safe_exec(lambda: q_builder().execute())
     return res.data or []
 
+# ---------------------------------------------------------------------
+# POST /api/events  (crear evento - requiere sesión)
+# ---------------------------------------------------------------------
 
-# --------------------- POST: Crear Evento -------------------------
+class EventCreate(BaseModel):
+    # Mantengo tus campos para compatibilidad con tu UI actual
+    nombre: str
+    email: Optional[EmailStr] = None   # ← ignorado en BD; se usa el email del token
+    descripcion: str
+    categoria: str
+    municipio: str
+    nivel: Literal["Principiante", "Intermedio", "Avanzado"]
+    fecha: date          # "YYYY-MM-DD"
+    hora: time           # "HH:MM"
 
 @router.post("", status_code=201)
-def create_event(payload: EventCreate):
-
+async def create_event(
+    payload: EventCreate,
+    current_user = Depends(get_current_user),   # ← exige sesión
+    authorization: Optional[str] = Header(None),
+) -> dict:
+    """
+    Crea un evento (requiere login). Combina fecha+hora en 'inicio' (UTC)
+    y guarda en la tabla 'eventos'. Garantiza chat por evento usando admin si es necesario.
+    Si viene Authorization, inscribe al creador como participante y miembro del chat.
+    """
     try:
-        # Convertir fecha + hora a UTC ISO8601
-        inicio_utc = datetime.combine(payload.fecha, payload.hora) \
-            .replace(tzinfo=timezone.utc).isoformat()
+        # Email desde el usuario autenticado (no confiamos en payload.email)
+        email = getattr(current_user, "email", None) or (isinstance(current_user, dict) and current_user.get("email"))
+        if not email:
+            raise HTTPException(status_code=401, detail="No se pudo obtener el email del usuario")
+
+        # Validación fecha futura (opcional pero útil)
+        inicio_dt = datetime.combine(payload.fecha, payload.hora).replace(tzinfo=timezone.utc)
+        if inicio_dt < datetime.now(timezone.utc):
+            raise HTTPException(status_code=422, detail="La fecha y hora deben ser futuras")
+
+        # Normaliza nivel al ENUM de BD
+        nivel_db = _normalize_nivel(payload.nivel)
 
         row = {
-            "nombre_evento": payload.nombre_evento,
+            "creador_nombre": payload.nombre,  # opcional (si tienes esta columna)
+            "creador_email": email,
             "descripcion": payload.descripcion,
             "categoria": payload.categoria,
             "municipio": payload.municipio,
-            "inicio": inicio_utc,
+            "nivel": nivel_db,
+            "inicio": inicio_dt.isoformat(),
             "estado": "activo",
             "creador_email": payload.creador_email
         }
 
-        res = supabase.table("eventos").insert(row).execute()
-
-        data = res.data or []
+        # 1) Insertar el evento (con cliente público; RLS permitirá insert si hay policy)
+        ev_ins = supabase.table("eventos").insert(row).execute()
+        data = ev_ins.data or []
         if not data:
-            raise HTTPException(400, "No se pudo crear el evento")
+            raise HTTPException(status_code=400, detail="No se pudo crear el evento.")
+        created = data[0]
+        evento_id = created.get("id") or created.get("evento_id")
 
-        evento = data[0]
+        # 2) Crear/garantizar chat asociado al evento (ADMIN; evita problemas de RLS/policies)
+        try:
+            admin = get_admin_client()
+            title = created.get("descripcion") or f"Chat del evento #{evento_id}"
+            admin.table("chats").upsert({
+                "evento_id": evento_id,
+                "title": title,
+                "is_group": True,
+            }, on_conflict="evento_id").execute()
+        except Exception:
+            # best-effort; si falla por políticas o ya existe, seguimos
+            pass
 
-        # Buscar id del usuario creador
-        ures = (
-            supabase.table("usuarios")
-            .select("id")
-            .eq("email", payload.creador_email)
-            .maybe_single()
-            .execute()
-        )
+        # 3) Si viene Authorization, inscribir a quien lo creó como participante y miembro del chat
+        token = _bearer(authorization)
+        user_id = _uid_from_token(authorization)
+        if token and user_id:
+            sb = supabase_for_token(token)
+            # (a) participante del evento
+            sb.table("event_participants").upsert(
+                {"evento_id": evento_id, "user_id": user_id, "status": "active", "joined_at": _now_iso()},
+                on_conflict="evento_id,user_id",
+            ).execute()
+            # (b) encontrar chat del evento
+            chat_row = sb.table("chats").select("id").eq("evento_id", evento_id).limit(1).execute().data or []
+            chat_id = chat_row[0]["id"] if chat_row else None
+            # (c) membresía del chat
+            if chat_id:
+                sb.table("chat_members").upsert(
+                    {"chat_id": chat_id, "user_id": user_id, "joined_at": _now_iso()},
+                    on_conflict="chat_id,user_id",
+                ).execute()
 
-        if ures.data:
-            enviar_notificacion(
-                usuario_id=ures.data["id"],
-                titulo="Evento creado",
-                mensaje=f"Tu evento '{evento['nombre_evento']}' ha sido creado.",
-                tipo="entreno"
-            )
-
-        return evento
+        return created
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------------------
+# Unirse / Dejar evento
+# ---------------------------------------------------------------------
+
+@router.post("/{event_id}/join")
+async def join_event(
+    event_id: int,
+    current_user = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Garantiza chat por evento e inscribe al usuario en:
+    - event_participants (evento_id,user_id)
+    - chat_members (chat_id,user_id)
+    Devuelve chat_id.
+
+    Todas las operaciones que dependen de RLS se hacen con el cliente firmado (JWT).
+    La creación del chat (si no existe) se hace con admin para evitar políticas restrictivas.
+    """
+    # 0) cliente firmado + user_id
+    token = _bearer(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta token")
+    sb = supabase_for_token(token)
+    user_id = _user_id_from(current_user)
+
+    # 1) validar evento (con RLS si aplica)
+    ev_rows = sb.table("eventos").select("id").eq("id", event_id).limit(1).execute().data or []
+    if not ev_rows:
+        raise HTTPException(status_code=404, detail="Evento no existe")
+
+    # 2) obtener o crear chat del evento
+    chat_rows = sb.table("chats").select("id").eq("evento_id", event_id).limit(1).execute().data or []
+    if chat_rows:
+        chat_id = chat_rows[0]["id"]
+    else:
+        # intenta crear con el usuario; si falla por policy, crea con admin
+        try:
+            created = sb.table("chats").insert({
+                "evento_id": event_id,
+                "is_group": True,
+                "title": f"Chat del evento #{event_id}",
+                "created_by": user_id,
+            }).execute().data or []
+            chat_id = created[0]["id"] if created else None
+        except Exception:
+            chat_id = None
+
+        if not chat_id:
+            admin = get_admin_client()
+            try:
+                created = admin.table("chats").insert({
+                    "evento_id": event_id,
+                    "is_group": True,
+                    "title": f"Chat del evento #{event_id}",
+                    "created_by": user_id,
+                }).execute().data or []
+                if created:
+                    chat_id = created[0]["id"]
+                else:
+                    # si la inserción no devolvió fila, intentamos recuperar
+                    again = admin.table("chats").select("id").eq("evento_id", event_id).limit(1).execute().data or []
+                    if not again:
+                        raise HTTPException(status_code=500, detail="No se pudo crear ni recuperar el chat del evento")
+                    chat_id = again[0]["id"]
+            except Exception as e:
+                # Manejar caso de inserciones concurrentes que produzcan clave única duplicada
+                msg = str(e)
+                if 'duplicate key value violates unique constraint' in msg or '23505' in msg:
+                    again = admin.table("chats").select("id").eq("evento_id", event_id).limit(1).execute().data or []
+                    if again:
+                        chat_id = again[0]["id"]
+                    else:
+                        raise HTTPException(status_code=500, detail="Conflicto al crear chat y no se pudo recuperar el registro")
+                else:
+                    raise HTTPException(status_code=500, detail=f"No se pudo crear ni recuperar el chat del evento: {str(e)}")
+
+    # 3) upsert participante del evento
+    sb.table("event_participants").upsert(
+        {"evento_id": event_id, "user_id": user_id, "status": "active", "joined_at": _now_iso()},
+        on_conflict="evento_id,user_id",
+    ).execute()
+
+    # 4) upsert membresía del chat
+    sb.table("chat_members").upsert(
+        {"chat_id": chat_id, "user_id": user_id, "joined_at": _now_iso()},
+        on_conflict="chat_id,user_id",
+    ).execute()
+
+    return {"ok": True, "event_id": event_id, "chat_id": chat_id}
 
 
-# --------------------- PUT: Confirmar Evento ---------------------
+@router.post("/{event_id}/leave")
+async def leave_event(
+    event_id: int,
+    current_user = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    El usuario autenticado deja el evento: se elimina su participación
+    y su membresía en el chat si existe. Operaciones con cliente firmado (RLS).
+    """
+    token = _bearer(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Falta token")
+    sb = supabase_for_token(token)
+    user_id = _user_id_from(current_user)
 
-@router.put("/{event_id}/confirmar")
-def confirmar_evento(event_id: int):
+    # obtener chat del evento (si existe)
+    chat = sb.table("chats").select("id").eq("evento_id", event_id).limit(1).execute().data or []
+    chat_id = chat[0]["id"] if chat else None
 
-    try:
-        res = (
-            supabase.table("eventos")
-            .select("*")
-            .eq("id", event_id)
-            .single()
-            .execute()
-        )
+    if chat_id:
+        # borra SOLO tu membresía
+        sb.table("chat_members").delete().match({"chat_id": chat_id, "user_id": user_id}).execute()
 
-        evento = res.data
-        if not evento:
-            raise HTTPException(404, "Evento no encontrado")
+    # borra SOLO tu participación en el evento
+    sb.table("event_participants").delete().match({"evento_id": event_id, "user_id": user_id}).execute()
 
-        supabase.table("eventos").update(
-            {"estado": "confirmado"}
-        ).eq("id", event_id).execute()
-
-        # Notificar
-        creador_email = evento["creador_email"]
-
-        ures = (
-            supabase.table("usuarios")
-            .select("id")
-            .eq("email", creador_email)
-            .maybe_single()
-            .execute()
-        )
-
-        if ures.data:
-            enviar_notificacion(
-                usuario_id=ures.data["id"],
-                titulo="Entrenamiento confirmado",
-                mensaje=f"Tu entrenamiento '{evento['nombre_evento']}' ha sido confirmado.",
-                tipo="match"
-            )
-
-        return {"status": "ok"}
-
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
-
-
-# --------------------- PUT: Cancelar Evento ----------------------
-
-@router.put("/{event_id}/cancelar")
-def cancelar_evento(event_id: int):
-
-    try:
-        res = (
-            supabase.table("eventos")
-            .select("*")
-            .eq("id", event_id)
-            .single()
-            .execute()
-        )
-
-        evento = res.data
-        if not evento:
-            raise HTTPException(404, "Evento no encontrado")
-
-        supabase.table("eventos").update(
-            {"estado": "cancelado"}
-        ).eq("id", event_id).execute()
-
-        creador_email = evento["creador_email"]
-
-        ures = (
-            supabase.table("usuarios")
-            .select("id")
-            .eq("email", creador_email)
-            .maybe_single()
-            .execute()
-        )
-
-        if ures.data:
-            enviar_notificacion(
-                usuario_id=ures.data["id"],
-                titulo="Entrenamiento cancelado",
-                mensaje=f"Tu entrenamiento '{evento['nombre_evento']}' ha sido cancelado.",
-                tipo="entreno"
-            )
-
-        return {"status": "ok"}
-
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
+    return {"ok": True}

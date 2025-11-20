@@ -1,12 +1,51 @@
-from supabase import create_client, Client # Añadí 'Client' para type hinting
-from dotenv import load_dotenv
+# src/fitlink_backend/supabase_client.py
 import os
+from typing import Optional
+from dotenv import load_dotenv, find_dotenv
+from supabase import create_client, Client
 
-load_dotenv()
-url = os.getenv("SUPABASE_URL")
-service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-if not url or not service_key:
-    raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY")
+# Carga el .env EN ESTE MÓDULO, antes de leer variables
+load_dotenv(find_dotenv(), override=False)
 
-# Exportamos el cliente con el type hint
-supabase: Client = create_client(url, service_key)
+def _getenv(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(
+            f"Falta la variable de entorno {name}. "
+            f"Define {name} en tu .env o exporta la variable antes de ejecutar el servidor."
+        )
+    return v
+
+SUPABASE_URL = _getenv("SUPABASE_URL")
+# Clave pública para firmar requests "normales" del usuario
+SUPABASE_ANON_KEY = _getenv("SUPABASE_ANON_KEY")
+# Clave de servicio (opcional). ÚSALA SOLO si necesitas bypass de RLS en tareas admin.
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+def get_admin_client() -> Client:
+    """
+    Cliente con privilegios altos (bypass RLS) si existe SERVICE_ROLE,
+    si no, cae a ANON. Úsalo con MUCHO cuidado.
+    """
+    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
+    # DEBUG: indicate which key type is being used (do not print the key value)
+    try:
+        if SUPABASE_SERVICE_ROLE_KEY:
+            print("[SUPABASE_CLIENT] Using SERVICE_ROLE key for admin client")
+        else:
+            print("[SUPABASE_CLIENT] SERVICE_ROLE key not set, using ANON key for admin client")
+    except Exception:
+        pass
+    return create_client(SUPABASE_URL, key)
+
+# Cliente global "admin/anon" para endpoints públicos/simples.
+supabase: Client = get_admin_client()
+
+def supabase_for_token(jwt_token: str) -> Client:
+    """
+    Crea un cliente autenticado con el JWT del usuario para que PostgREST
+    ejecute las políticas RLS con auth.uid() correctamente.
+    """
+    client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    client.postgrest.auth(jwt_token)
+    return client
