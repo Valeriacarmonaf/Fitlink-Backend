@@ -236,57 +236,53 @@ async def get_user_suggestions(
     current_user: Annotated[Any, Depends(get_current_user)]
 ):
     """
-    Obtiene sugerencias de usuarios con 4 niveles de prioridad:
-        P1 → mismo municipio + misma habilidad
-        P2 → mismo municipio + misma categoría
+    Obtiene sugerencias de usuarios con 4 niveles de prioridad, usando las columnas
+    'intereses' y 'nivel_habilidad' de la tabla 'usuarios'.
+    
+        P1 → mismo municipio + mismo nivel de habilidad
+        P2 → mismo municipio + misma categoría (interés)
         P3 → mismo municipio
-        P4 → mismas habilidades
-        
-    Con `usuario_categoria` como tabla relacional.
+        P4 → mismo nivel de habilidad
+    
+    NOTA: Se asume que 'nivel_habilidad' es un nivel de habilidad general (int2).
     """
 
     try:
         user_id = current_user.id
-        user_email = current_user.email
+        # El user_email ya no es necesario para obtener intereses/habilidades
 
         # -----------------------------
-        # Obtener municipio
+        # Obtener municipio, intereses y nivel de habilidad del usuario actual
         # -----------------------------
         profile_res = (
             supabase.table("usuarios")
-            .select("municipio")
+            .select("municipio, intereses, nivel_habilidad")
             .eq("id", user_id)
             .single()
             .execute()
         )
 
-        my_municipio = profile_res.data.get("municipio") if profile_res.data else None
+        user_data = profile_res.data
+        if not user_data:
+            raise HTTPException(status_code=404, detail="Perfil de usuario no encontrado.")
 
-        # -----------------------------
-        # Obtener mis habilidades
-        # -----------------------------
-        my_skills_res = (
-            supabase.table("usuario_categoria")
-            .select("categoria_id, nivel_id")
-            .eq("usuario_email", user_email)
-            .execute()
-        )
+        my_municipio = user_data.get("municipio")
+        # 'intereses' es un array de IDs (ej. [1, 5, 8])
+        my_category_ids = set(user_data.get("intereses") or []) 
+        # 'nivel_habilidad' es un INT (ej. 3)
+        my_skill_level = user_data.get("nivel_habilidad")
 
-        my_skills_data = my_skills_res.data or []
-
-        my_skill_set = set((s["categoria_id"], s["nivel_id"]) for s in my_skills_data)
-        my_category_set = set(s["categoria_id"] for s in my_skills_data)
-
-        # Si no hay municipio ni habilidades, no hay sugerencias
-        if not my_municipio and not my_skills_data:
+        # Si no hay municipio, intereses o nivel de habilidad, no hay sugerencias
+        if not my_municipio and not my_category_ids and my_skill_level is None:
             return []
 
         # -----------------------------
         # Obtener otros usuarios
         # -----------------------------
+        # NOTA: La selección de 'usuario_categoria' se ha eliminado
         all_other_users_res = (
             supabase.table("usuarios")
-            .select("id, nombre, biografia, municipio, foto_url, usuario_categoria(categoria_id, nivel_id)")
+            .select("id, nombre, biografia, municipio, foto_url, intereses, nivel_habilidad")
             .neq("id", user_id)
             .execute()
         )
@@ -295,37 +291,61 @@ async def get_user_suggestions(
             return []
 
         p1, p2, p3, p4 = [], [], [], []
+        
+        # Lista de IDs ya sugeridas para evitar duplicados
+        suggested_ids = set()
 
         for user in all_other_users_res.data:
+            user_id_check = user.get("id")
+            
+            # Omitir si ya fue sugerido en una prioridad superior
+            if user_id_check in suggested_ids:
+                continue
+                
             user_municipio = user.get("municipio")
-            user_skills_data = user.get("usuario_categoria", [])
+            user_category_ids = set(user.get("intereses") or [])
+            user_skill_level = user.get("nivel_habilidad")
 
-            user_skill_set = set((s["categoria_id"], s["nivel_id"]) for s in user_skills_data)
-            user_category_set = set(s["categoria_id"] for s in user_skills_data)
-
+            # Comparaciones
             matches_municipio = (user_municipio == my_municipio) and my_municipio is not None
-            shared_skills = my_skill_set & user_skill_set
-            shared_categories = my_category_set & user_category_set
+            # Nivel de habilidad: solo si ambos lo tienen definido
+            matches_skill_level = (user_skill_level == my_skill_level) and my_skill_level is not None
+            # Categorías (Intereses): verifica si hay al menos una categoría en común
+            shared_categories = bool(my_category_ids & user_category_ids)
 
-            # PRIORIDADES
-            if matches_municipio and shared_skills:
-                user["suggestion_reason"] = "municipio_y_habilidad"
-                p1.append(clean_user_data(user))
+            # -----------------------------
+            # Lógica de Prioridades
+            # -----------------------------
+            
+            # PRIORIDAD 1: mismo municipio + mismo nivel de habilidad
+            if matches_municipio and matches_skill_level:
+                user["suggestion_reason"] = "municipio_y_nivel_habilidad"
+                p1.append(user)
+                suggested_ids.add(user_id_check)
 
+            # PRIORIDAD 2: mismo municipio + misma categoría (interés)
             elif matches_municipio and shared_categories:
                 user["suggestion_reason"] = "municipio_y_categoria"
-                p2.append(clean_user_data(user))
+                p2.append(user)
+                suggested_ids.add(user_id_check)
 
+            # PRIORIDAD 3: mismo municipio
             elif matches_municipio:
                 user["suggestion_reason"] = "municipio"
-                p3.append(clean_user_data(user))
+                p3.append(user)
+                suggested_ids.add(user_id_check)
 
-            elif shared_skills:
-                user["suggestion_reason"] = "habilidad"
-                p4.append(clean_user_data(user))
+            # PRIORIDAD 4: mismo nivel de habilidad
+            elif matches_skill_level:
+                user["suggestion_reason"] = "nivel_habilidad"
+                p4.append(user)
+                suggested_ids.add(user_id_check)
 
+        # Combinamos y retornamos los resultados
         return p1 + p2 + p3 + p4
 
+    except HTTPException as e:
+        raise e
     except Exception as e:
         print(f"Error inesperado en /users/suggestions: {e}")
-        raise HTTPException(500, "Error interno del servidor")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
