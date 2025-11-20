@@ -23,11 +23,13 @@ async def get_event_suggestions(
     """
     try:
         user_id = current_user.id
-        user_email = current_user.email
+        # El email ya no es necesario para obtener las categorías
+        # user_email = current_user.email 
 
-        # 1. Obtener el municipio del perfil
+        # 1. Obtener el municipio y los intereses (categorías) del perfil
+        # Se modificó la selección para obtener tanto 'municipio' como 'intereses'
         profile_res = supabase.table("usuarios") \
-            .select("municipio") \
+            .select("municipio, intereses") \
             .eq("id", user_id) \
             .single() \
             .execute()
@@ -36,21 +38,22 @@ async def get_event_suggestions(
             raise HTTPException(status_code=404, detail="Perfil de usuario no encontrado.")
 
         user_municipio = profile_res.data.get('municipio')
-
+        
         # 2. Obtener las IDs de las categorías (intereses) del usuario
-        my_skills_res = supabase.table("usuario_categoria") \
-            .select("categoria") \
-            .eq("usuario_email", user_email) \
-            .execute()
+        # Se obtiene directamente de la columna 'intereses' de la tabla 'usuarios'
+        # El resultado es un array de int8, por lo que ya es la lista de IDs.
+        my_category_ids = profile_res.data.get('intereses') or [] 
 
-        my_category_ids = [skill['categoria'] for skill in my_skills_res.data]
+        # Se elimina la consulta a 'usuario_categoria'
 
         if not user_municipio and not my_category_ids:
+            # Devuelve una lista vacía si no hay municipio ni intereses
             return []
 
         # --- Lógica de Prioridad ---
         now = datetime.datetime.utcnow().isoformat()
-        select_cols = "*, categoria ( nombre, icono )"
+        # Se asegura que la relación con 'categoria' sigue siendo necesaria para obtener el nombre/icono
+        select_cols = "*, categoria ( nombre, icono )" 
         
         p1_events = []
         p2_events = []
@@ -83,7 +86,8 @@ async def get_event_suggestions(
             if ids_en_p1:
                 query = query.not_.in_("id", list(ids_en_p1))
             if my_category_ids:
-                query = query.not_.in_("categoria", my_category_ids)
+                # Excluye eventos que coinciden con los intereses
+                query = query.not_.in_("categoria", my_category_ids) 
 
             p2_res = query.order("inicio", desc=False).execute()
             p2_events = p2_res.data or []
@@ -103,7 +107,8 @@ async def get_event_suggestions(
             if ids_en_p1_y_p2:
                 query = query.not_.in_("id", list(ids_en_p1_y_p2))
             if user_municipio:
-                query = query.not_.eq("municipio", user_municipio)
+                # Excluye eventos que ya fueron priorizados por municipio (P1 o P2)
+                query = query.not_.eq("municipio", user_municipio) 
                 
             p3_res = query.order("inicio", desc=False).execute()
             p3_events = p3_res.data or []
@@ -116,5 +121,6 @@ async def get_event_suggestions(
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error inesperado en /events/suggestions: {e}")
+        # Se modificó para un mejor manejo de errores.
+        print(f"Error inesperado en /events/suggestions: {e}") 
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")

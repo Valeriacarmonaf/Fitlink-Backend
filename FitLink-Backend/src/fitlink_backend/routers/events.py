@@ -5,7 +5,7 @@ from pydantic import BaseModel, EmailStr
 from fitlink_backend.supabase_client import supabase
 
 # Importar función para crear notificaciones
-from fitlink_backend.routes.notificaciones import enviar_notificacion
+from fitlink_backend.routers.notificaciones import enviar_notificacion
 
 router = APIRouter(prefix="/api/events", tags=["events"])
 
@@ -209,4 +209,3 @@ def cancelar_evento(event_id: int):
 
     except Exception as e:
         raise HTTPException(500, detail=str(e))
-
