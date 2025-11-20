@@ -5,16 +5,8 @@ from dotenv import load_dotenv
 import os
 import datetime
 
-# Supabase client
-from fitlink_backend.supabase_client import supabase
-
-# Routers
-from fitlink_backend.routers import events
-from fitlink_backend.routers import stats
-from fitlink_backend.routers import suggestions
-from fitlink_backend.routers import users
-from fitlink_backend.routers.chat import router as chat_router
-from fitlink_backend.routes import notificaciones
+# Rutas
+from fitlink_backend.routers import events, stats, suggestions, users, intereses
 
 # Modelos para auth
 from fitlink_backend.models.UserSignUp import UserSignUp
@@ -29,6 +21,7 @@ app = FastAPI(title="FitLink Backend")
 # ---------------------------------------------------------
 origins = [
     "http://localhost:5173",
+    "http://localhost:5174"
 ]
 
 app.add_middleware(
@@ -44,6 +37,7 @@ app.add_middleware(
 # ---------------------------------------------------------
 app.include_router(events.router)
 app.include_router(stats.router)
+app.include_router(intereses.router)
 app.include_router(suggestions.router)
 app.include_router(users.router)
 app.include_router(chat_router)
@@ -130,11 +124,7 @@ def delete_user(user_id: int):
         raise HTTPException(status_code=500, detail=res.error.message)
     return {"ok": True}
 
-
-# ---------------------------------------------------------
-# Auth: Registro
-# ---------------------------------------------------------
-@app.post("/auth/register", status_code=201)
+@app.post("/auth/register", status_code=201, response_model=None)
 def register_user(user_data: UserSignUp):
     try:
         auth_response = supabase.auth.sign_up({

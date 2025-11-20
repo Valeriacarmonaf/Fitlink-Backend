@@ -39,11 +39,11 @@ async def get_event_suggestions(
 
         # 2. Obtener las IDs de las categorías (intereses) del usuario
         my_skills_res = supabase.table("usuario_categoria") \
-            .select("categoria_id") \
+            .select("categoria") \
             .eq("usuario_email", user_email) \
             .execute()
 
-        my_category_ids = [skill['categoria_id'] for skill in my_skills_res.data]
+        my_category_ids = [skill['categoria'] for skill in my_skills_res.data]
 
         if not user_municipio and not my_category_ids:
             return []
@@ -61,7 +61,7 @@ async def get_event_suggestions(
             p1_res = supabase.table("eventos") \
                 .select(select_cols) \
                 .eq("municipio", user_municipio) \
-                .in_("categoria_id", my_category_ids) \
+                .in_("categoria", my_category_ids) \
                 .gte("inicio", now) \
                 .neq("estado", "cancelado") \
                 .order("inicio", desc=False) \
@@ -83,7 +83,7 @@ async def get_event_suggestions(
             if ids_en_p1:
                 query = query.not_.in_("id", list(ids_en_p1))
             if my_category_ids:
-                query = query.not_.in_("categoria_id", my_category_ids)
+                query = query.not_.in_("categoria", my_category_ids)
 
             p2_res = query.order("inicio", desc=False).execute()
             p2_events = p2_res.data or []
@@ -96,7 +96,7 @@ async def get_event_suggestions(
         if my_category_ids:
             query = supabase.table("eventos") \
                 .select(select_cols) \
-                .in_("categoria_id", my_category_ids) \
+                .in_("categoria", my_category_ids) \
                 .gte("inicio", now) \
                 .neq("estado", "cancelado")
 
