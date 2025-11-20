@@ -4,13 +4,16 @@ from typing import Annotated, Any, Optional
 from dotenv import load_dotenv
 import os
 import datetime
+from fitlink_backend.supabase_client import supabase
 
 # Rutas
-from fitlink_backend.routers import events, stats, suggestions, users, intereses
+from fitlink_backend.routers import events, stats, suggestions, users, intereses, chat, notificaciones
+
 
 # Modelos para auth
 from fitlink_backend.models.UserSignUp import UserSignUp
 from fitlink_backend.models.UserLogin import UserLogin
+from fitlink_backend.auth import get_current_user
 
 load_dotenv()
 
@@ -40,31 +43,8 @@ app.include_router(stats.router)
 app.include_router(intereses.router)
 app.include_router(suggestions.router)
 app.include_router(users.router)
-app.include_router(chat_router)
+app.include_router(chat.router)
 app.include_router(notificaciones.router)
-
-# ---------------------------------------------------------
-# Dependencias
-# ---------------------------------------------------------
-async def get_current_user(authorization: Annotated[str | None, Header()] = None) -> Any:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Falta el encabezado de autorización")
-
-    token = authorization.replace("Bearer ", "")
-    if not token:
-        raise HTTPException(status_code=401, detail="Token malformado")
-
-    try:
-        user_response = supabase.auth.get_user(token)
-
-        if user_response.user is None:
-            raise HTTPException(status_code=401, detail="Token inválido o sesión expirada")
-
-        return user_response.user
-
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Error de autenticación: {str(e)}")
-
 
 # ---------------------------------------------------------
 # Health Check
@@ -215,3 +195,14 @@ async def login_with_google(redirect_to: Optional[str] = None):
     )
 
     return {"oauth_url": supabase_google_oauth_url}
+
+@app.get("/routes")
+def list_routes():
+    routes = []
+    for route in app.routes:
+        if hasattr(route, "methods") and hasattr(route, "path"):
+            routes.append({
+                "path": route.path,
+                "methods": list(route.methods)
+            })
+    return routes

@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Annotated, Any
 from fitlink_backend.supabase_client import supabase
-from fitlink_backend.main import get_current_user
+from fitlink_backend.auth import get_current_user
 
 router = APIRouter(
     prefix="/notificaciones",
