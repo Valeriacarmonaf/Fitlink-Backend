@@ -2,7 +2,7 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta, timezone
 from fitlink_backend.supabase_client import supabase
-from fitlink_backend.routes.notificaciones import enviar_notificacion
+from fitlink_backend.routers.notificaciones import enviar_notificacion
 import threading
 import time
 
