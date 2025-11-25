@@ -1,6 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from typing import Annotated, Any, Optional
 from fastapi.responses import JSONResponse
+from typing import Annotated, Any
+import datetime
+
+# Importa el cliente de DB y el dependency de auth
 from fitlink_backend.supabase_client import supabase
 from fitlink_backend.dependencies import get_current_user
 from fitlink_backend.supabase_client import get_admin_client
@@ -280,24 +284,31 @@ async def report_user(
                 "reason": reason,
             }).execute()
         except Exception as db_exc:
+            # Mensaje de error puede venir como dict/string que contiene el código 23505
             msg = str(db_exc)
             low = msg.lower()
             if '23505' in low or 'duplicate key' in low or 'unique' in low:
+                # Ya existe un reporte por ese reporter → devolver 409 con JSON limpio
                 reports_res = admin.table("user_reports").select("id").eq("reported_id", user_id).execute()
                 reports_count = len(reports_res.data or [])
                 return JSONResponse(status_code=409, content={
                     "message": "Ya reportaste a este usuario.",
                     "reports_count": reports_count
                 })
+            # Otros errores de BD
             print(f"DB insert error al reportar usuario {user_id}: {msg}")
             raise HTTPException(status_code=500, detail="Error al insertar reporte en la base de datos")
 
+        # Si la respuesta de la inserción contiene un error, manejarlo.
         if getattr(ins, 'error', None):
             err_msg = getattr(ins.error, 'message', str(ins.error))
             low = err_msg.lower() if isinstance(err_msg, str) else ''
+            # Distinguir conflicto de duplicado (mismo reporter reportando mismo usuario)
             if 'duplicate' in low or '23505' in low or 'unique' in low:
+                # Obtener conteo actual y devolver 409 para indicar que ya reportó
                 reports_res = admin.table("user_reports").select("id").eq("reported_id", user_id).execute()
                 reports_count = len(reports_res.data or [])
+                # Devolver JSON limpio y legible para el frontend
                 return JSONResponse(status_code=409, content={
                     "message": "Ya reportaste a este usuario.",
                     "reports_count": reports_count
