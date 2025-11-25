@@ -16,6 +16,9 @@ from fitlink_backend.supabase_client import (
 # Import del usuario autenticado (soporta nombre español/inglés del archivo)
 from fitlink_backend.dependencies import get_current_user  # <- si se llama 'dependencies.py'
 
+# Importar función para crear notificaciones
+from fitlink_backend.routers.notificaciones import enviar_notificacion
+
 router = APIRouter(prefix="/api/events", tags=["events"])
 
 # ---------------------------------------------------------------------
@@ -132,6 +135,7 @@ async def latest_events(
     ))
     return res.data or []
 
+
 @router.get("")
 async def list_events(
     limit: int = Query(50, ge=1, le=200),
@@ -220,6 +224,7 @@ async def create_event(
             "precio": 0.0,                      # por ahora eventos gratuitos
             "estado": "activo",
             "creador_email": email,
+            "creador_email": payload.creador_email #CUIDADO AQUÍ
         }
 
         # 6) Insertar el evento
