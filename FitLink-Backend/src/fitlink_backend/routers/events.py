@@ -159,11 +159,18 @@ async def create_event(
         if not email:
             raise HTTPException(status_code=401, detail="No se pudo obtener el email del usuario")
 
-        inicio_dt = datetime.combine(payload.fecha, payload.hora).replace(tzinfo=timezone.utc)
-        if inicio_dt < datetime.now(timezone.utc):
-            raise HTTPException(status_code=422, detail="La fecha y hora deben ser futuras")
+        # 2) Validación fecha futura
+        ahora = datetime.now()
+        inicio_dt = datetime.combine(payload.fecha, payload.hora)
 
-        fin_dt = inicio_dt + timedelta(hours=1)
+        if inicio_dt < ahora:
+            raise HTTPException(
+                status_code=422,
+                detail="La fecha y hora deben ser futuras"
+            )
+        fin_dt = inicio_dt + timedelta(hours=1)  # por ahora duración fija de 1h
+
+        # 3) Validar/normalizar nivel (aunque no lo guardemos todavía)
         _ = _normalize_nivel(payload.nivel)
 
         # Buscar ID de categoria
