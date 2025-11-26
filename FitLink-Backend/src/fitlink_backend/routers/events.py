@@ -224,7 +224,6 @@ async def create_event(
             "precio": 0.0,                      # por ahora eventos gratuitos
             "estado": "activo",
             "creador_email": email,
-            "creador_email": payload.creador_email #CUIDADO AQUÍ
         }
 
         # 6) Insertar el evento
