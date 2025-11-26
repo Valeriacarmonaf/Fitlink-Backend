@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Body
+import base64
+from fastapi import APIRouter, Depends, HTTPException, Body, UploadFile, File
 from typing import Annotated, Any, Optional
 from fastapi.responses import JSONResponse
 from typing import Annotated, Any
@@ -121,6 +122,54 @@ async def update_my_profile(
         print(f"Error actualizando perfil: {e}")
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
     
+@router.post("/me/upload-foto")
+async def upload_foto_base64(
+    current_user: Annotated[Any, Depends(get_current_user)],
+    avatar: UploadFile = File(...)
+):
+    """
+    Recibe una imagen, la convierte a Base64 y la guarda en el campo 'foto_url' (text) de la tabla usuarios.
+    """
+    try:
+        user_id = current_user.id
+        
+        # 1. Leer los bytes del archivo
+        file_bytes = await avatar.read()
+        
+        # (Opcional) Validación básica de tamaño para no saturar la BD
+        # Si la imagen es mayor a 2MB, podrías rechazarla
+        if len(file_bytes) > 2 * 1024 * 1024:
+             raise HTTPException(status_code=400, detail="La imagen es demasiado grande. Máximo 2MB.")
+
+        # 2. Convertir a Base64
+        base64_encoded = base64.b64encode(file_bytes).decode("utf-8")
+        
+        # 3. Crear el string con formato Data URI para que el navegador lo entienda
+        # Ejemplo: "data:image/png;base64,iVBORw0KGgo..."
+        mime_type = avatar.content_type or "image/jpeg"
+        foto_base64 = f"data:{mime_type};base64,{base64_encoded}"
+
+        # 4. Actualizar el campo foto_url en la tabla usuarios
+        update_res = supabase.table("usuarios") \
+            .update({"foto_url": foto_base64}) \
+            .eq("id", user_id) \
+            .execute()
+
+        # Verificar si hubo actualización
+        if not update_res.data:
+             raise HTTPException(status_code=404, detail="No se pudo actualizar el usuario")
+
+        return {
+            "message": "Foto actualizada correctamente (Base64)",
+            "foto_url": foto_base64  # Retornamos el string para que el frontend lo muestre de inmediato
+        }
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error procesando Base64: {e}")
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+
 # ---------------------------------------------------------------------------
 # Endpoints de Soporte y Sugerencias (Se mantienen sin cambios relevantes)
 # ---------------------------------------------------------------------------
