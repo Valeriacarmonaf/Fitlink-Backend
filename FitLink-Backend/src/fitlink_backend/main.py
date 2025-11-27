@@ -117,10 +117,46 @@ def create_user_report(payload: UserReportIn, current_user=Depends(get_current_u
         }
 
         admin = get_admin_client()
-        res = admin.table("user_reports").insert(insert_payload).execute()
 
+        # Ejecutar la inserción y capturar errores de BD (p. ej. duplicados)
+        try:
+            res = admin.table("user_reports").insert(insert_payload).execute()
+        except Exception as db_exc:
+            # El cliente puede lanzar excepción en vez de devolver un objeto con .error
+            msg = str(db_exc).lower()
+            if '23505' in msg or 'duplicate key' in msg or 'unique' in msg:
+                try:
+                    reports_res = admin.table("user_reports").select("id").eq("reported_id", payload.reported_id).execute()
+                    reports_count = len(reports_res.data or [])
+                except Exception:
+                    reports_count = None
+
+                return JSONResponse(status_code=409, content={
+                    "message": "Ya reportaste a este usuario.",
+                    "reports_count": reports_count,
+                })
+            # Otros errores de BD: registrar y devolver mensaje genérico
+            print(f"DB exception al insertar user_report: {db_exc}")
+            raise HTTPException(status_code=500, detail="Error al crear reporte de usuario")
+
+        # Si la respuesta del cliente contiene un error, manejarlo de forma segura
         if getattr(res, "error", None):
-            raise HTTPException(status_code=500, detail=str(res.error))
+            err_msg = getattr(res.error, "message", str(res.error))
+            low = err_msg.lower() if isinstance(err_msg, str) else ""
+            if '23505' in low or 'duplicate key' in low or 'unique' in low:
+                try:
+                    reports_res = admin.table("user_reports").select("id").eq("reported_id", payload.reported_id).execute()
+                    reports_count = len(reports_res.data or [])
+                except Exception:
+                    reports_count = None
+
+                return JSONResponse(status_code=409, content={
+                    "message": "Ya reportaste a este usuario.",
+                    "reports_count": reports_count,
+                })
+
+            print(f"Error insertando user_report: {err_msg}")
+            raise HTTPException(status_code=500, detail="Error al crear reporte de usuario")
 
         return {"ok": True, "id": new_id, "created_at": created_at}
     except HTTPException:
