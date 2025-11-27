@@ -28,6 +28,7 @@ from fitlink_backend.models.UserSignUp import UserSignUp
 from fitlink_backend.models.UserLogin import UserLogin
 from fitlink_backend.supabase_client import supabase, get_admin_client
 from fitlink_backend.auth import get_current_user
+import uuid
 
 load_dotenv()
 
@@ -80,6 +81,52 @@ app.include_router(suggestions.router)
 app.include_router(users.router)
 app.include_router(chat_router.router)
 app.include_router(notificaciones.router)
+
+
+# ---------------------------------------------------------
+# Reportes de usuario
+# ---------------------------------------------------------
+from pydantic import BaseModel
+
+
+class UserReportIn(BaseModel):
+    reported_id: str
+    reason: str
+
+
+@app.post("/reports/users")
+def create_user_report(payload: UserReportIn, current_user=Depends(get_current_user)):
+    """
+    Crea un reporte de usuario en la tabla `user_reports`.
+    Campos en la tabla: id (uuid), reported_id (uuid), reporter_id (uuid), reason (text), created_at (timestamp with time zone)
+    """
+    try:
+        reporter_id = getattr(current_user, "id", None)
+        if not reporter_id:
+            raise HTTPException(status_code=401, detail="No se pudo determinar el usuario autenticado")
+
+        new_id = str(uuid.uuid4())
+        created_at = datetime.datetime.utcnow().isoformat()
+
+        insert_payload = {
+            "id": new_id,
+            "reported_id": payload.reported_id,
+            "reporter_id": reporter_id,
+            "reason": payload.reason,
+            "created_at": created_at,
+        }
+
+        admin = get_admin_client()
+        res = admin.table("user_reports").insert(insert_payload).execute()
+
+        if getattr(res, "error", None):
+            raise HTTPException(status_code=500, detail=str(res.error))
+
+        return {"ok": True, "id": new_id, "created_at": created_at}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------
